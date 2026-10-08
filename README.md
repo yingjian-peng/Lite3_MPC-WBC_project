@@ -2,8 +2,6 @@
 
 面向云深处 Lite3 的平地运动控制工程。目标是通过 **MPC+WBC** 实现前进、后退、左右平移、原地旋转，以及这些方向的混合速度命令，并在 **MuJoCo** 和真机上验证。工程保留原有 ONNX 强化学习控制链，便于后续在相同机器人模型、输入命令和关节接口下对比两种方法。
 
-[运动演示](#运动演示) · [运行 MuJoCo](#运行-mujoco-仿真) · [真机构建](#真机构建) · [工程结构](#工程结构)
-
 ## 1. 运动演示
 
 | 前进与后退 | 左右平移 | 原地旋转 |
@@ -12,17 +10,17 @@
 
 演示文件：[前进/后退](docs/video/01_前进-后退.gif) · [左右平移](docs/video/02_左右平移.gif) · [原地旋转](docs/video/03_原地旋转.gif)。
 
-## 2. 当前控制链与后续接入
+## 2. 当前控制链
 
 ```mermaid
 flowchart LR
     A[键盘或手柄命令] --> B[状态机]
     C[MuJoCo 或 Lite3 真机状态] --> D[机器人统一接口]
     D --> B
-    B --> E[ONNX 策略线程：当前已接入]
-    B -. 后续互斥选择 .-> F[MPC+WBC 控制线程：待实现]
+    B --> E[ONNX 策略线程]
+    B -. 互斥选择 .-> F[MPC+WBC 控制线程]
     E --> G[12×5 关节命令]
-    F -. 后续接入 .-> G
+    F -. 接入 .-> G
     G --> D
 ```
 
@@ -31,14 +29,28 @@ flowchart LR
 ## 3. 工程结构
 
 ```text
-onnx/           ONNX 推理代码与策略模型
-state_machine/  站起、趴下、阻尼、ONNX 控制状态及切换
-robot_models/   Lite3 URDF/MJCF、网格与 MuJoCo 平地场景
-interface/      MuJoCo UDP、真机 SDK、键盘和手柄接口
-mpc_wbc/        MPC+WBC 算法预留目录，当前仅有说明
-support/        共用类型、工具、传输脚本和第三方依赖
-docs/           工程说明与运动演示 GIF
+Lite3_MPC-WBC_project/
+├── CMakeLists.txt                 C++ 构建入口
+├── main.cpp                       程序入口
+├── README.md                      工程说明
+├── onnx/                          ONNX 推理与策略模型
+│   ├── run_policy/                推理接口和实现
+│   └── policy/                    ONNX 模型和转换示例
+├── state_machine/                 状态机与控制状态
+│   └── parameters/                Lite3 控制参数
+├── robot_models/                  机器人模型与平地环境
+├── interface/                     仿真、真机、控制接口
+│   ├── robot/
+│   └── user_command/
+├── mpc_wbc/                       MPC+WBC 算法
+├── support/                       相对固定的共用与外部支持文件
+│   ├── types/                     共用数据类型
+│   ├── utils/                     数学工具与遥测
+│   ├── scripts/                   真机文件传输脚本
+│   └── third_party/               Eigen、ONNX Runtime、手柄库与 Lite3 SDK
+└── docs/                          工程结构和维护文档
 ```
+
 
 ## 4. 运行 MuJoCo 仿真
 
