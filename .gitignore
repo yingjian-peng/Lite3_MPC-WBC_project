@@ -1,0 +1,11 @@
+build
+MUJOCO_LOG.TXT
+__pycache__/
+*.pyc
+*.zip
+.vscode
+
+
+support/third_party/libtorch
+support/third_party/x30_motion_sdk
+**/tmp/*

@@ -1,0 +1,4 @@
+<mujoco model="Lite3_flat">
+    <include file="Lite3.xml"/>
+    <include file="../../../../environments/flat/mjcf/floor.xml"/>
+</mujoco>
