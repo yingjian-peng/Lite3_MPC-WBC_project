@@ -128,6 +128,7 @@ struct MpcWrench {
     Vec3d net_force = Vec3d::Zero();
     Vec3d net_moment = Vec3d::Zero();
     int status = -1;                   // -1=未跑 0=ok 1=stale 2=failed
+    int reason = 0;                    // status==2 的原因：1=估计无效 2=支撑腿<1 3=MPC 无有效解
     int iters = 0;
     double qp_residual = 0.0;
     double solve_ms = 0.0;
@@ -212,8 +213,15 @@ struct ControllerOutput {
     double wbc_swing_accel_error = 0.0;
     double tau_abs_max = 0.0;
     int wbc_iters = 0;
+    // 摆动腿诊断：WBC 看到的期望/实际足端世界 z（支撑腿记 0）+ 计划支撑腿数
+    std::array<double, kNumLegs> swing_des_z{};
+    std::array<double, kNumLegs> swing_now_z{};
+    int stance_count = 0;
     bool mpc_fresh = false;
-    int mpc_status = -1;             // -1=本帧未跑 0=ok 1=stale 2=failed
+    int mpc_status = -1;             // -1=本帧未跑 0=ok 1=stale 2=failed（-1 ⇔ 本帧 a_des 被清零）
+    int mpc_reason = 0;              // 清零原因：0=正常 1=估计无效 2=支撑腿<1 3=MPC 无解 4=wrench 过期
+    bool mpc_held = false;           // 本帧沿用了最近一次有效 wrench（不是本帧新解）
+    double mpc_wrench_age = 0.0;     // 本帧实际使用的 wrench 年龄 [s]
     double mpc_net_fz = 0.0;
     int mpc_iters = 0;          // MPC 盒约束 QP 迭代数（诊断用）
     double mpc_qp_residual = 0.0;
@@ -288,6 +296,7 @@ public:
         estimator_.Reset(t);   // 世界原点 = 进入该状态时的机身位置
         estimate_ = StateEstimate();
         wrench_in_ = MpcWrench();
+        last_good_wrench_ = MpcWrench();
         seq_wrench_.Write(MpcWrench());
         a_des_.setZero();
         alpha_des_.setZero();
@@ -368,9 +377,15 @@ public:
     MpcWrench SolveWrench(const MpcRequest& req) {
         MpcWrench w;
         w.t = req.t;
-        if (!req.est_valid || req.num_support < 1) {
+        if (!req.est_valid) {
             w.status = 2;
+            w.reason = 1;
             return w;  // 保持上一次 wrench（调用方读旧快照）
+        }
+        if (req.num_support < 1) {
+            w.status = 2;
+            w.reason = 2;
+            return w;
         }
         const Mat3d R = RpyToRotation(req.rpy);
         SrbdMpcInput mpc_in;
@@ -396,7 +411,10 @@ public:
         w.iters = out.iters;
         w.qp_residual = out.qp_residual;
         w.solve_ms = out.solve_ms;
-        if (!out.ok()) return w;  // 失败：保持上一次 wrench
+        if (!out.ok()) {
+            w.reason = 3;
+            return w;  // 失败：保持上一次 wrench
+        }
         w.valid = true;
         w.foot_force_ref = out.foot_force;
         w.net_force = out.net_force;
@@ -551,30 +569,44 @@ private:
             for (int leg = 0; leg < kNumLegs; ++leg)
                 win.foot_vel_world[leg] = Jc.block<3, kWbcQdd>(3 * leg, 0) * qvel;
 
-            // 用最近一次有效的 MPC wrench（可能来自别的线程）。快照过期过久就当没有，
-            // 退化成「基座零加速度」——原地保持比重放旧 wrench 安全。
+            // 用最近一次**有效**的 MPC wrench（可能来自别的线程）。
+            //
+            // 关键：单帧求解失败（估计瞬时无效 / 支撑腿<1 / MPC 无有效解）**不得**把上一帧还新鲜的
+            // wrench 一并作废——否则 WBC 会在「有力参考」与「零加速度」之间断续切换。实测 trot 行走中
+            // 19% 的 MPC 周期被清零（翻车前窗口 30%），是竖向振荡的激励源；而估计器的数值本身是准的
+            // （height 与真值差 <1 mm），只是零速反解的 `valid` 标志在摆动腿落地时翻假。
+            // 因此这里保留最近一次有效 wrench，直到它超过 wrench_max_age 才退化为零加速度
+            // （「原地保持比重放旧 wrench 安全」仍由 age 上限保证）。
             const MpcWrench& w = wrench_in_;
+            if (w.valid) last_good_wrench_ = w;
+            const auto fresh_enough = [&](const MpcWrench& c) {
+                const double age = in.t - c.t;
+                return c.valid && age >= -1e-9 && age <= p.wrench_max_age;
+            };
+            const MpcWrench* src = nullptr;
+            if (fresh_enough(w)) {
+                src = &w;                       // 本帧快照
+            } else if (fresh_enough(last_good_wrench_)) {
+                src = &last_good_wrench_;       // 沿用最近一次有效 wrench
+            }
+
+            out.mpc_status = src ? w.status : -1;   // -1 ⇔ 本帧 a_des 被清零
+            out.mpc_reason = src ? 0 : (w.valid ? 4 : (w.reason != 0 ? w.reason : 4));
+            out.mpc_held = (src == &last_good_wrench_);
+            out.mpc_wrench_age = src ? (in.t - src->t) : 0.0;
             out.mpc_fresh = false;
-            out.mpc_status = w.status;
             out.mpc_ms = w.solve_ms;
             out.mpc_iters = w.iters;
             out.mpc_qp_residual = w.qp_residual;
-            const double wrench_age = in.t - w.t;
-            const bool wrench_usable = w.valid && wrench_age >= -1e-9 &&
-                                       wrench_age <= p.wrench_max_age;
-            if (wrench_usable) {
-                win.foot_force_ref = w.foot_force_ref;
-                a_des_ = w.a_des_world;
-                alpha_des_ = w.alpha_des_body;
-                const Mat3d I_com_world = model_.CompositeInertiaWorld(in.q, R, com_body);
-                a_des_ = w.a_des_world;
-                alpha_des_ = w.alpha_des_body;
-                out.mpc_net_fz = w.net_force.z();
-                out.mpc_fresh = (wrench_age < 2.0 * p.mpc_period);
+            if (src != nullptr) {
+                win.foot_force_ref = src->foot_force_ref;
+                a_des_ = src->a_des_world;
+                alpha_des_ = src->alpha_des_body;
+                out.mpc_net_fz = src->net_force.z();
+                out.mpc_fresh = (w.valid && out.mpc_wrench_age < 2.0 * p.mpc_period);
             } else {
                 a_des_.setZero();
                 alpha_des_.setZero();
-                out.mpc_status = -1;
             }
             win.a_des_world = a_des_;
             win.alpha_des_body = alpha_des_;
@@ -583,10 +615,16 @@ private:
 
             // 摆动足期望：机体系目标 → 世界系（默认只用偏航，避免把机身倾斜写进轨迹）
             const Mat3d R_ref = p.swing_target_yaw_only ? YawOnly(R) : R;
+            out.stance_count = 0;
             for (int leg = 0; leg < kNumLegs; ++leg) {
-                if (win.stance[leg]) continue;
+                if (win.stance[leg]) {
+                    ++out.stance_count;
+                    continue;
+                }
                 win.foot_des_world[leg] = estimate_.base_pos_w + R_ref * legs[leg].foot_pos;
                 win.foot_vel_des_world[leg] = R_ref * legs[leg].foot_vel;
+                out.swing_des_z[leg] = win.foot_des_world[leg].z();
+                out.swing_now_z[leg] = win.foot_pos_world[leg].z();
             }
 
             // ---- WBC ----
@@ -704,6 +742,7 @@ private:
     bool height_cmd_initialized_ = false;
     double last_dt_ = 0.0;
     MpcWrench wrench_in_;                    // 本帧使用的 wrench（来自本线程或序列锁快照）
+    MpcWrench last_good_wrench_;             // 最近一次有效 wrench（求解失败时按 age 上限沿用）
     SeqLockBox<MpcWrench> seq_wrench_;       // 跨线程发布用（单线程模式下只当缓存）
     Vec3d a_des_ = Vec3d::Zero();
     Vec3d alpha_des_ = Vec3d::Zero();

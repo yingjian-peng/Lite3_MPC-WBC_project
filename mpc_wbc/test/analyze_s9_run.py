@@ -228,8 +228,21 @@ def main():
                     "mpc_ms_max": float(col(diag, "mpc_ms")[di].max()),
                     "mpc_iters_max": int(col(diag, "mpc_iters")[di].max()),
                     "mpc_a_des_zero_pct": 100.0 * float(np.mean(col(diag, "mpc_status")[di] == -1)),
+                    "mpc_held_pct": 100.0 * float(np.mean(col(diag, "mpc_held")[di]))
+                    if "mpc_held" in diag[0] else 0.0,
+                    "mpc_reason_pct": {int(r): round(100.0 * float(np.mean(col(diag, "mpc_reason")[di] == r)), 1)
+                                       for r in range(5)} if "mpc_reason" in diag[0] else {},
                     "num_support_min": int(col(diag, "num_support")[di].min()),
                 }
+                if "mpc_reason" in diag[0]:
+                    rs = col(diag, "mpc_reason")[di].astype(int)
+                    held = 100.0 * float(np.mean(col(diag, "mpc_held")[di]))
+                    zero = 100.0 * float(np.mean(col(diag, "mpc_status")[di] == -1))
+                    reasons = " ".join(
+                        f"r{r}={100.0 * float(np.mean(rs == r)):.0f}%"
+                        for r in range(1, 5) if np.any(rs == r))
+                    print(f"{'':14} mpc: 沿用={held:.1f}% 清零={zero:.1f}% {reasons}"
+                          f" | 未激活={100.0 - float(np.mean(col(diag, 'wbc')[di])) * 100.0:.1f}%")
         out["phases_out"].append(rec)
 
     # 全局：每次跌倒的最早时刻（只看运动段；若场景本身只有静立段，则看最后一段）

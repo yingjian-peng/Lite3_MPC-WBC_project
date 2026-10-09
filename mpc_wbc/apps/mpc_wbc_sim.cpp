@@ -162,7 +162,8 @@ int main(int argc, char** argv) {
     dcsv << "t,phase,mode,wbc,stale,dt,tilt_deg,height,est_conf,est_valid,num_support,"
             "kp,tau_ff_max,tau_wbc_max,sum_fz,a_des_x,a_des_z,alpha_des_y,eom_res,contact_res,"
             "cone_viol,base_acc_err,swing_acc_err,wbc_iters,wbc_ms,mpc_ms,step_ms,mpc_status,"
-            "mpc_iters,mpc_res,v_est_x,v_est_y,wrench_age\n";
+            "mpc_iters,mpc_res,v_est_x,v_est_y,wrench_age,mpc_reason,mpc_held,"
+                 "nstance,sdz0,saz0,sdz1,saz1,sdz2,saz2,sdz3,saz3\n";
     dcsv.flush();
 
     double cmd_scale = 1.0;   // 命令缩放（A/B 用）
@@ -343,7 +344,12 @@ int main(int argc, char** argv) {
                  << out.wbc_iters << "," << out.wbc_ms << "," << out.mpc_ms << "," << out.step_ms
                  << "," << out.mpc_status << "," << out.mpc_iters << "," << out.mpc_qp_residual
                  << "," << controller.estimate().base_vel_w.x() << ","
-                 << controller.estimate().base_vel_w.y() << "," << (t - controller.wrench().t)
+                 << controller.estimate().base_vel_w.y() << "," << out.mpc_wrench_age << ","
+                 << out.mpc_reason << "," << (out.mpc_held ? 1 : 0) << "," << out.stance_count
+                 << "," << out.swing_des_z[0] << "," << out.swing_now_z[0]
+                 << "," << out.swing_des_z[1] << "," << out.swing_now_z[1]
+                 << "," << out.swing_des_z[2] << "," << out.swing_now_z[2]
+                 << "," << out.swing_des_z[3] << "," << out.swing_now_z[3]
                  << "\n";
             // 注意：文件 flush 会阻塞几 ms，绝不能放在控制计时区间里（这里在写行之后）
             if (static_cast<long>(rel * 1000) % 500 == 0) dcsv.flush();
