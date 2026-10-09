@@ -16,6 +16,7 @@ add_compile_options(-fPIC)
 option(BUILD_SIM "Build the MuJoCo UDP simulation controller" OFF)
 option(SEND_REMOTE "Copy the built controller to Lite3" OFF)
 option(USE_MOLD_LINKER "Use mold for faster linking" OFF)
+option(BUILD_MPC_WBC_TESTS "Build MPC/WBC table-check tests" OFF)
 
 if(BUILD_PLATFORM STREQUAL "arm" OR SEND_REMOTE)
   set(BUILD_SIM OFF)
@@ -45,6 +46,11 @@ include_directories(
 link_directories(${ONNX_RUNTIME_ROOT}/lib)
 
 add_subdirectory(interface)
+
+if(BUILD_MPC_WBC_TESTS)
+  enable_testing()
+endif()
+add_subdirectory(mpc_wbc)
 
 if(SEND_REMOTE)
   set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)

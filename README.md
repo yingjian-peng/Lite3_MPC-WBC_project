@@ -67,6 +67,18 @@ cmake -S . -B build -DBUILD_PLATFORM=x86 -DBUILD_SIM=ON -DSEND_REMOTE=OFF
 cmake --build build -j
 ```
 
+### MPC+WBC 开发对表（可选）
+
+MPC+WBC 算法位于 `mpc_wbc/`，当前已完成运动学（FK/IK/雅可比）。开启对表测试后可用 CTest 跑 MuJoCo 数值对照（需要 `python3` 与 `mujoco`）：
+
+```bash
+cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON
+cmake --build build -j
+cd build && ctest -R mpc_wbc --output-on-failure
+```
+
+`BUILD_MPC_WBC_TESTS` 默认关闭，不影响上面的 ONNX 仿真/真机构建。详见 [mpc_wbc/README.md](mpc_wbc/README.md) 与 [MPC+WBC 实现步骤与里程碑](docs/04_Lite3_MPC_WBC实现步骤与里程碑.md)。
+
 分别在两个终端运行：
 
 ```bash
