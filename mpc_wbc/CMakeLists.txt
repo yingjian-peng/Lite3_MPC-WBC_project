@@ -26,7 +26,17 @@ if(BUILD_MPC_WBC_TESTS)
   target_link_libraries(lite3_gait_trajectory_test PRIVATE mpc_wbc)
   add_executable(lite3_state_estimator_test test/lite3_state_estimator_test.cpp)
   target_link_libraries(lite3_state_estimator_test PRIVATE mpc_wbc)
+  add_executable(lite3_srbd_mpc_test test/lite3_srbd_mpc_test.cpp)
+  target_link_libraries(lite3_srbd_mpc_test PRIVATE mpc_wbc)
+  add_executable(qp_ipm_test test/qp_ipm_test.cpp)
+  target_link_libraries(qp_ipm_test PRIVATE mpc_wbc)
+  add_executable(lite3_wbc_test test/lite3_wbc_test.cpp)
+  target_link_libraries(lite3_wbc_test PRIVATE mpc_wbc)
   add_test(NAME mpc_wbc_gait_trajectory COMMAND lite3_gait_trajectory_test)
+  # S6 SRBD-MPC 离线自检：不需要 MuJoCo，纯数值/物理检查
+  add_test(NAME mpc_wbc_srbd_mpc COMMAND lite3_srbd_mpc_test)
+  # S7：自研 QP 求解器单测 + Weighted-QP WBC 离线自检（不需要 MuJoCo）
+  add_test(NAME mpc_wbc_qp_ipm COMMAND qp_ipm_test)
 
   find_program(PYTHON3_EXECUTABLE python3)
   if(PYTHON3_EXECUTABLE)
@@ -56,6 +66,30 @@ if(BUILD_MPC_WBC_TESTS)
     set_tests_properties(mpc_wbc_dynamics PROPERTIES
       WORKING_DIRECTORY ${WORKSPACE_DIR}
       FIXTURES_REQUIRED mpc_wbc_dyn_cases)
+
+    # S7 WBC：接触偏置加速度真值 → WBC 自检（导出 q/qvel/qdd/f/τ/stance）→ MuJoCo 正动力学复核
+    set(MPC_WBC_CA_CASES ${CMAKE_BINARY_DIR}/wbc_contact_accel_cases.txt)
+    set(MPC_WBC_WBC_CASES ${CMAKE_BINARY_DIR}/wbc_mujoco_cases.csv)
+    add_test(NAME mpc_wbc_gen_contact_accel_cases
+      COMMAND ${PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_mujoco_contact_accel_cases.py
+              ${MPC_WBC_CA_CASES} 100)
+    add_test(NAME mpc_wbc_wbc
+      COMMAND lite3_wbc_test ${MPC_WBC_CA_CASES} ${MPC_WBC_WBC_CASES})
+    add_test(NAME mpc_wbc_wbc_mujoco
+      COMMAND ${PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/check_wbc_hover_mujoco.py
+              ${MPC_WBC_WBC_CASES})
+    set_tests_properties(mpc_wbc_gen_contact_accel_cases PROPERTIES
+      WORKING_DIRECTORY ${WORKSPACE_DIR}
+      FIXTURES_SETUP mpc_wbc_ca_cases)
+    set_tests_properties(mpc_wbc_wbc PROPERTIES
+      WORKING_DIRECTORY ${WORKSPACE_DIR}
+      FIXTURES_REQUIRED mpc_wbc_ca_cases
+      FIXTURES_SETUP mpc_wbc_wbc_csv)
+    set_tests_properties(mpc_wbc_wbc_mujoco PROPERTIES
+      WORKING_DIRECTORY ${WORKSPACE_DIR}
+      FIXTURES_REQUIRED mpc_wbc_wbc_csv)
 
     set(MPC_WBC_EST_CASES ${CMAKE_BINARY_DIR}/mpc_wbc_estimator_rollout.csv)
     add_test(NAME mpc_wbc_gen_estimator_rollout

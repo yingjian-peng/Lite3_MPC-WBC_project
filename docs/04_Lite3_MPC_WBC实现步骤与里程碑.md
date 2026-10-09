@@ -88,7 +88,7 @@ flowchart TD
 | S3 | `mpc_wbc/02_gait_trajectory.hpp` | `01_trotgait_scheduler.*`、`02_trotfoot_trajectory.*` |
 | S4 | 位置环接入（S8 前用临时测试入口/离线 harness） | `06_*` 的走路层 |
 | S5 | `mpc_wbc/01_state_estimator.hpp` | — |
-| S6 | `mpc_wbc/03_srbd_mpc.hpp/.cpp` | `07_srbd_mpc.*`、`04_srbd.hpp` |
+| S6 | `mpc_wbc/03_srbd_mpc.hpp`、`mpc_wbc/box_qp.hpp` | `07_srbd_mpc.*`、`04_srbd.hpp`、`08_box_qp.hpp` |
 | S7 | `mpc_wbc/04_weighted_wbc.hpp/.cpp` | `09_weighted_wbc.*`、附录 D |
 | S8 | `mpc_wbc/05_mpc_wbc_controller.hpp`、`state_machine/mpc_control_state.hpp` | `state_machine/mpc_control_state.hpp` |
 | S9 | `state_machine/auto_test_runner.hpp`（或等价测试脚本） | 参考工程 `auto_test_runner.hpp` |
@@ -180,9 +180,9 @@ flowchart TD
 - **理论对应**：第 5 章、附录 D。
 - **交付**：`mpc_wbc/04_weighted_wbc.hpp/.cpp`（含求解器适配）。
 - **硬约束**：浮动基动力学等式 `M·qdd − J_allᵀ·f − Sᵀ·τ = −h`（固定 18 行）；支撑足无滑 `J_i·qdd + Jdot_i·v = a_contact_des`（**不得省略 `Jdot·v`**）；摆动足 `f_i=0`；摩擦金字塔（每腿 5 行）；总力矩/关节限幅用变量上下界。
-- **软任务**：① MPC 第 0 节点逐脚力跟踪；② 基座 6D 线/角加速度跟踪；③ 摆动足 `a_des + Kp(p_des−p) + Kd(v_des−v)`（`kp_swing=200, kd_swing=10`）；④ 接近名义站姿与小幅力矩正则。权重 `w_base=1e3, w_swing=1e2`。
-- **固定行布局**：`18(EoM) + 每腿 3 行等式槽 + 每腿 5 行锥槽`，尺寸不随支撑集变化 → 可热启动。
-- **求解器选型（待决策）**：本工程 `support/third_party/` 目前**没有** qpOASES/OSQP；需评估 qpOASES/OSQP/ProxQP 的**许可证、依赖、构建方式、ARM 可用性**。`08_box_qp.hpp` 只能解盒约束 QP，**不能单独承担 WBC**。
+- **软任务**：① MPC 第 0 节点逐脚力跟踪（`w_f_ref=0` **默认关**，参考工程实测会拉偏平衡）；② 基座 6D 线/角加速度跟踪（`w_base=1e3`）；③ 摆动足 `a_des + Kp(p_des−p) + Kd(v_des−v)`（`w_swing=1e2, kp_swing=200, kd_swing=10`）；④ 接近名义站姿（`w_posture=0` **默认关**）与小幅力矩正则（`w_tau=0` **默认关**）。**默认关闭的三项都是「抢同一组关节/同一组力」的任务，实测打开会让主任务同时变差**（见 §8 S7 坑 3）。
+- **固定行布局**：`18(EoM) + 每腿 3 行等式槽 + 每腿 5 行锥槽 + 4 行法向力上限 + 24 行力矩上下界`，尺寸不随支撑集变化 → 便于将来主动集热启动。
+- **求解器选型（已决策）**：自研稠密原-对偶内点法（`mpc_wbc/qp_ipm.hpp`），**不引入 qpOASES**（LGPL-2.1，真机/闭源方向有传染风险）。`08_box_qp.hpp` 只能解盒约束 QP，**不承担 WBC**。代价：不支持热启动（S10 若要 1 kHz 需换主动集，见 §8 S7 边界）。
 - **通过条件**：动力学/接触/摩擦残差在容差内；力矩不超过当前环境限值（仿真 `±30 N·m`）；QP 失败可报告且不发送坏命令；`Solve` 耗时有记录。
 - **风险**：`τ_total` 与低层执行律 `τ_applied=kp(q_des−q)+kd(dq_des−dq)+tau_ff` 的关系 → 必须用**同一帧实测** `q,dq` 反解 `tau_ff = τ_total − kp(q_des−q) − kd(dq_des−dq)`，避免力矩重复。
 
@@ -266,8 +266,8 @@ flowchart TD
 | S3 | 步态与足端轨迹 | S2 | ✅ 通过（见 §8） |
 | S4 | 位置环跑步（基线平台） | S3 | ✅ 通过（见 §8） |
 | S5 | 状态估计 | S2,S4 | ✅ 通过（见 §8） |
-| S6 | SRBD preview MPC | S3,S5 | ⬜ 未开始 |
-| S7 | Weighted-QP WBC | S2,S5,S6 | ⬜ 未开始 |
+| S6 | SRBD preview MPC | S3,S5 | ✅ 通过（见 §8） |
+| S7 | Weighted-QP WBC | S2,S5,S6 | ✅ 通过（见 §8） |
 | S8 | 控制器编排 + 状态机线程 | S4,S6,S7 | ⬜ 未开始 |
 | S9 | MuJoCo 运动验证 / A/B | S8 | ⬜ 未开始 |
 | S10 | 工程化打磨 | S9 | ⬜ 未开始 |
@@ -279,9 +279,9 @@ flowchart TD
 
 ## 7. 待决策项（进入对应步骤前必须定）
 
-1. **QP 求解器**（S7 前）：qpOASES / OSQP / ProxQP 的许可证、依赖、构建、ARM 可用性；`support/third_party/` 需新增哪一个。
+1. **QP 求解器**（S7 前）：~~qpOASES / OSQP / ProxQP 的许可证、依赖、构建、ARM 可用性；`support/third_party/` 需新增哪一个。~~ → **已定：自研稠密原-对偶内点法**（`mpc_wbc/qp_ipm.hpp`，零第三方依赖）。理由：qpOASES 是 LGPL-2.1，本工程要往真机/闭源方向走，源码直链有传染风险；而 WBC 的 QP 只有 42 变量、30 等式 + 48 不等式，内点法每帧 ~10 次迭代、单帧 mean `0.39 ms`，够用。**代价**：内点法不支持热启动，S10 若要 1 kHz 需改成主动集 + 工作集缓存（见 §8 S7 边界）。
 2. **接触估计来源**（S5 前）：计划支撑相 + 运动学残差是否足够；是否需要为 MuJoCo 增加向后兼容的真值诊断通道。
-3. **姿态通道级别**（S6 前）：先做「只预测质心 p/v」的验收版，还是直接上「质心 + 姿态」完整版。
+3. **姿态通道级别**（S6 前）：~~先做「只预测质心 p/v」的验收版，还是直接上「质心 + 姿态」完整版。~~ → **已定：直接上完整版**（状态 `[p,v,rpy,ω]`，输出逐脚力 + 净力/净力矩），见 §8 S6。
 4. **状态/按键复用**（S8 前）：是否保留 `RLControlMode=6` 数值与按键语义（首版建议保留）。
 5. **仿真力矩语义**（S7/S9 前）：记录 `data.ctrl` 与限幅后 `actuator_force`/`qfrc_actuator`，确认实际输出力矩。
 
@@ -360,6 +360,76 @@ flowchart TD
 
 - **过程记录（一个坑）**：最初在「所有腿都处于支撑相」的假设下检查支撑速度，但 `t=0.3 T_stance` 时后半周期腿（`FR/HL`）已进入摆动；改为按每条腿各自的支撑相中段取样后通过。
 - **边界/待办**：支撑相为机体系开环后扫（世界锚点锁定待 S5 后有基座速度估计再做）；停步为立即回名义足位（未做收步过渡）；摆动起落点与支撑相速度存在已知跳变（位置连续）。
+
+### S7 Weighted-QP WBC（✅ 已通过）
+
+- **交付**：[`mpc_wbc/qp_ipm.hpp`](../mpc_wbc/qp_ipm.hpp)（自研稠密 QP：原-对偶内点 + Mehrotra 预测-校正）、[`mpc_wbc/04_weighted_wbc.hpp`](../mpc_wbc/04_weighted_wbc.hpp)（`WbcParams/Input/Output`、`WeightedWbc::Solve/SolveOnce/BuildQp`）、测试 [`test/qp_ipm_test.cpp`](../mpc_wbc/test/qp_ipm_test.cpp) + [`test/lite3_wbc_test.cpp`](../mpc_wbc/test/lite3_wbc_test.cpp) + [`test/gen_mujoco_contact_accel_cases.py`](../mpc_wbc/test/gen_mujoco_contact_accel_cases.py) + [`test/check_wbc_hover_mujoco.py`](../mpc_wbc/test/check_wbc_hover_mujoco.py) + `run_wbc_test.sh`；`00_lite3_model.hpp` 补 `ContactBiasAccel`（`Jdot·v`）并修 `IntegrateBodyRotation` 的负 `dt` 守卫。
+- **理论对应**：docs/03 第 5 章 + §11、附录 D。
+- **决策变量与行布局（固定）**：`x = [q̈(18); f(12); τ(12)] ∈ R^42`；等式 30 行 = `18(EoM: M q̈ − Jᵀf − Sᵀτ = −h) + 4×3`（支撑腿 `Jc_i q̈ = −Jdotc_i v`、摆动腿 `f_i=0`）；不等式 48 行 = `4×5` 摩擦金字塔 + `4` 法向力上限 + `24` 力矩上下界。行数不随支撑集变化（摆动腿留空行 `0 ≥ −1`），便于将来换主动集热启动。
+- **软任务**：① 基座 6D 加速度（`w_base=1e3`）；② 摆动足任务空间 PD（`w_swing=1e2`，`kp=200/kd=10`）；③ 站姿任务（`w_posture=0` **默认关**）；④ MPC 逐脚力参考（`w_f_ref=0` **默认关**）；⑤ 力矩努力正则（`w_tau=0` **默认关**）。**③④⑤ 默认关闭是实测结论，不是偷懒**（见下「抢权重」一节）。
+- **验证**：`mpc_wbc/test/run_wbc_test.sh`（= CTest 的 `mpc_wbc_qp_ipm` + `mpc_wbc_wbc` + `mpc_wbc_wbc_mujoco`），全部 0 failures。
+
+| 项 | 结果 | 判定 |
+| --- | --- | --- |
+| QP 单测（解析解 / 与盒约束 QP 交叉 / 40 组随机 KKT / 退化 NNLS / 冗余等式 / 无不等式 / 不可行识别） | 0 failures，交叉最大差 `6.5e-10` | ✅ |
+| 接触偏置加速度 `Jdot·v` 对表 MuJoCo（100 随机工况） | max `1.6e-9` | ✅ |
+| 静立悬停（四脚支撑） | `Σfz=117.1079 N = mg`（误差 `0.0000%`），EoM `1.4e-14`，接触 `3.9e-18`，锥违反 `0`，`|τ|max=3.86` | ✅ |
+| 基座 6D 跟踪（±x/±y/偏航；四脚支撑无摆动腿） | 误差 `~5e-9`（相对 `1e-9`）→ **无竞争任务时基座任务精确** | ✅ |
+| 摆动腿任务（对角支撑 + `qvel≠0`） | 残差 `0.033 m/s²`；关闭任务时 `15.07` → **降 455 倍** | ✅ |
+| 摆动脚受力恒为 0 | `< 1e-17` | ✅ |
+| 支撑承重（两脚对角支撑，静止） | `Σfz = (M q̈ + h)_z` 精确到 `1e-6 N`；与 `mg` 差 `0.11%` | ✅ |
+| 加权最优性证书（`BuildQp` + `SolveQpIpm` 取乘子） | 驻点 `7.2e-8`、互补 `6.9e-8`、`min z=1.4e-12` | ✅ |
+| 权重敏感性 | `w_base↑ ⇒ 基座误差↓`、`w_swing↑ ⇒ 摆动残差↓`（单调） | ✅ |
+| 极限工况（`a_des=(6,4,0)`, `α_des=(0,0,5)`） | 锥违反 `8.7e-10`、`|τ|max=24.8 < 30`、EoM `7e-15` | ✅ |
+| 与 SRBD-MPC 串联 | 竖直力误差 `1.40%`；开力参考任务后偏差 `2.46 N`（关 `2.93 N`） | ✅ |
+| 求解耗时（200 帧 trot） | mean `0.39 ms` / max `0.58 ms`，0 失败帧 | ✅ |
+| 失败兜底 | 未过期 → `kStale`；过期/从未成功 → `kFailed`；全摆动 → `kFailed` | ✅ |
+| 低层 PD 反解 | `tau_ff = τ_wbc − kp(q_des−q) − kd(dq_des−dq)` 复现误差 `4.4e-16 N·m` | ✅ |
+| **MuJoCo 独立复核**（`check_wbc_hover_mujoco.py`：`ctrl=τ` + `mj_applyFT` 施加逐脚接触力 → `mj_forward`） | `max|qacc − qdd| = 1.8e-12`、支撑接触点加速度 `5.6e-11`、摆动 `f=8e-17` | ✅ |
+
+- **过程记录（按踩坑顺序）**：
+  1. **`IntegrateBodyRotation` 的负 `dt` 守卫写错**：`if (n*dt < 1e-12) return R;` 对负 `dt` 恒真 → 向后积分永远返回单位旋转。改 `std::fabs(n*dt)`。只影响向后积分，S1–S6 结果未受影响。
+  2. **自研内点法的四个数值坑**（都在 `qp_ipm.hpp`，已修，`qp_ipm_test` 全部覆盖）：① Eigen `LDLT` 对**对称不定 KKT** 会给出错误符号（实测 `dy` 反号→发散）→ 用 `PartialPivLU`（失败回退 `FullPivLU`）；② 起点松弛量取 `s = max(Gx−h, 1)`（整体平移到 `1e-3` 会把对偶变量顶到 `1e20`）；③ `Δz` 必须含**向心项** `+comp/s`（漏掉则互补性永不收敛、迭代冻结）；④ 步长不能写成 `min(step_scale, −s/ds)`（会把 `s` 打到恰好 0 → 下轮 `z/s = 0/0 = NaN`；且无约束限制时也乘 `0.995` 会退化成几何收敛）→ 先算最大可行步 `max_p`，`alpha = (max_p>=1) ? 1.0 : step_scale*max_p`；另有一处化简推导里 `comp/s` 的符号必须是 `t_i = (z/s)·r_ge − comp/s`。
+  3. **「打架的软任务」要删不要调**（对齐参考工程 `09_weighted_wbc`）：对角支撑 + `qvel≠0` 实测——`w_posture=1` 时摆动任务残差 `3.92 m/s²`、基座误差 `0.745`；`w_posture=0` 时降到 `0.033` / `0.193`（**两项同时变好**）。原因是站姿任务 `q̈_j = kp(q_nom−q)` 作用在摆动腿的同一组关节上，与摆动足笛卡尔任务直接抢权重。同理 `w_tau=1e-3` 会把无竞争的基座任务从 `q̈_x=0.5000` 拉到 `0.4999869`（`w_tau=0` 时 `4.2e-9`），因为它让「跟准基座」与「省力矩」在同一组接触力/力矩上折中。参考工程 `09_weighted_wbc` 的任务集**只有**基座 6D + 摆动足，且 `w_tau=0`，`w_f_ref`（力参考任务）在 docs/03 §11.3 里被整条删除（「会拉偏平衡」）。
+  4. **软任务只承诺「加权最优」，不是「都精确」**：这不只是措辞——`[4]` 原本断言「摆动残差 `< 1e-2`」是**错的验收口径**。改为：硬约束精确（EoM/接触/锥/τ）+ **KKT 最优性证书** + 「打开任务后残差比关闭时降 ≥50 倍」+ 权重单调性。另外用 scipy/SLSQP 独立求解 dump 出来的同一个 QP：cost 一致到 `3.6e-12`、`x` 完全相同，证明「两项都没精确满足」是真最优折中而不是求解器没收敛。
+  5. **`Σfz = m·g` 只在「没有摆动腿」时成立**：`qvel≠0` 时 EoM 的 z 行含四肢科氏/离心偏置，且腿部加速度经 `M` 的非对角块耦合进基座 z 行；即使 `qvel=0`，只要存在摆动腿任务（`Jc_swing q̈ = 0`），它也会把基座 z 加速度拉到 `−0.008 m/s²`（实测 `Σfz=116.97 N` vs `mg=117.11 N`）。正确口径：静态四脚无摆动 → `Σfz = mg`（`[2]`，误差 `0.0000%`）；一般情形 → `Σfz = (M q̈ + h)_z`（模型独立复算，精确到 `1e-6 N`）。
+  6. **MuJoCo 复核脚本的两个坑**：① `data.xfrc_applied` 在 MuJoCo ≥3.0 里**不被 `mj_forward` 消费**（只在 `mj_step` 生效），照旧写法会得到「外力凭空消失」的假失败 → 改用 `mj_applyFT` 累加进 `data.qfrc_applied`；② **球足踩平地面的接触点 = 球心 + 世界系 `(0,0,−r_foot)`**（不是机体系 `-z` 乘 `R_foot`）；按体坐标系旋转偏移会让 `Jᵀf` 的关节分量差 `0.36 N·m`，`qacc` 假失败到 `~1e2 rad/s²`。另：导出 CSV 必须 `setprecision(17)`，6 位有效数字的 `f/τ` 会被腿的小惯量放大成 `~1e-3 rad/s²` 的假误差。
+- **边界/待办**：
+  - **内点法不支持热启动**：单帧 mean `0.39 ms` 够 `250 Hz`（WBC 目标 20–50 Hz 富余大），但 S10 若要 1 kHz 必须换主动集 + 工作集缓存；行布局已按「固定行数」设计好。
+  - 站姿任务 / 力参考任务 / 力矩正则三个开关**保留但默认关**：需要时（例如想让 WBC 复现 MPC 的力分配）可显式打开，代价是基座跟踪变差。
+  - 法向力上限 `foot_force_max=200 N` 是软性保护（不是 MJCF 来的）；`tau_max=30 N·m` 取自 MJCF `ctrlrange`（12 个关节统一 ±30）。
+  - `w_base=1e3 / w_swing=1e2` 是**参考工程的整定值**，本工程还没在闭环里整定（S9/S10 用 7 段 A/B）。参考工程实测：`w_base` 1000 平衡 tilt/平滑、5000 反劣化；`w_swing` 100→20 要么无改善要么失稳。
+  - 摆动足任务用的是**接触点**雅可比（世界系），而摆动目标位置来自 `FootPositionBody`（球心）；两者差 `foot_radius` 的定值偏移，S9 接入轨迹层时需统一标注参考点。
+  - 支撑无滑用的是完整 `J q̈ = −Jdot q̇`（参考工程 `09_weighted_wbc` 用的是简化 `J q̈ = 0`）；本工程保留完整式，`Jdot·v` 已对表 MuJoCo。
+
+### S6 SRBD 预测时域 MPC（✅ 已通过）
+
+- **交付**：[`mpc_wbc/03_srbd_mpc.hpp`](../mpc_wbc/03_srbd_mpc.hpp)（`SrbdMpcParams` / `SrbdMpcInput` / `SrbdMpcOutput` / `SrbdPreviewMpc`）、[`mpc_wbc/box_qp.hpp`](../mpc_wbc/box_qp.hpp)（盒约束 QP）、[`mpc_wbc/test/lite3_srbd_mpc_test.cpp`](../mpc_wbc/test/lite3_srbd_mpc_test.cpp) + `run_srbd_mpc_test.sh`；`00_lite3_model.hpp` 补 `CompositeComBody/World`、`CompositeInertiaBody/World`（并在 S2 对表里新增两项 MuJoCo 校验）。
+- **理论对应**：docs/03 第 4 章 + §10.2。状态 `x=[p_com(3); v_com(3); rpy(3); ω_body(3)]`，等步长离散；命令为质心速度/偏航角速度/质心高度。
+- **决策与约束**：决策是「每支撑脚 × 每节点 × 4 个锥生成方向」的 `λ ≥ 0`（`f_i = Σ_j λ_j d_j`，`d_j=(μcosφ_j, μsinφ_j, 1)`）。摆动脚在该节点**不生成变量** → 受力结构性为 0；`Σλ = f_z` 上界取每方向 `f_z,max/4` → 单脚法向力 ≤ `f_z,max`；四棱锥与 §5.5 的 5 行金字塔判据等价。
+- **求解**：把每个 `λ` 的冲激响应拼成灵敏度矩阵 `S`（12N×V），代价化为 `½λᵀ(SᵀWS+R)λ + (SᵀW·e_free)ᵀλ`，再解盒约束 QP。**顺序必须是「先用齐次 A 前推一步，再叠加该步的 B·λ」**（docs/03 §10.2 的坑），重力只进自由轨迹。
+- **验证**（离线，不需要 MuJoCo）：`mpc_wbc/test/run_srbd_mpc_test.sh`，57 项检查全过。
+
+| 项 | 结果 | 判定 |
+| --- | --- | --- |
+| 静立悬停净力 | `117.1081 N` vs `mg=117.10786 N`（`0.0002%`） | ✅ |
+| 静立净力矩 / 水平足力 | `1.2e-7 N·m` / `< 1e-4 N` | ✅ |
+| 静立预测高度漂移（0.5 s） | `3.6e-6 m` | ✅ |
+| 速度响应（前/后/横移 0.1–0.3 m/s） | 方向正确、随命令单调、末端速度误差 `<1e-3 m/s` | ✅ |
+| 刹车 `0.3→0` | `F0.x=−64.4 N`，末端 `vx=−2e-4 m/s` | ✅ |
+| 偏航 `±0.6 rad/s` | `M_z=±4.71 N·m`，末端 `ω_z=0.60 rad/s` | ✅ |
+| 接触计划（trot，k=0 摆动 FL/HR） | 摆动脚力恒 `0`，两支撑腿合计 `117.10 N` | ✅ |
+| 摩擦锥 / 法向力上限 | 全部满足 | ✅ |
+| 姿态恢复（roll/pitch 0.1 rad、ω_y=0.5） | 恢复/阻尼力矩反向，预测姿态被拉回 | ✅ |
+| QP（100 帧 trot） | 全收敛（残差 `≤1e-13`），mean `0.53 ms` / max `0.71 ms` | ✅ |
+| 失败兜底 | 未过期 → `kStale` 沿用旧解；过期 → `kFailed` | ✅ |
+| 闭环（SRBD 模型当对象，200 步） | `vx→0.3000 m/s`、高度误差 `0`、roll `0` | ✅ |
+
+- **过程记录（三个坑）**：
+  1. **灵敏度递推顺序**：先 `s=A·s` 再叠加 `B·λ`，重力只放在自由轨迹里；顺序搞反静载荷会错（docs/03 §10.2 记的 `F0.z≈26 N` 就是这么来的）。本实现按此顺序，悬停直接得 `m·g`。
+  2. **`λ` 正则化不能乱选**：`r_lambda=1e-3` 与跟踪权重同量级，会为了压小 `λ` 而把承重拉偏 `0.25%`（预测高度漂移 4 mm）。改 `1e-6` 后误差降到 `2e-7`。**判断依据**：把 `r` 从 `1e-3` 调到 `1e-9`，承重误差从 0.25% 变到机器精度 → 定位到是正则项而非模型错误。
+  3. **盒约束 QP 的收敛性**：先写「按当前点重算 free 集 + 精确 α 截断」，在 λ 贴 0 的边界附近会一个约束爬一步、甚至 α=0 卡死（残差停在 `1e-2`，兜底投影梯度也救不回来）。最终做成三级：① 无约束解（落在盒内即全局最优，一次 LDLT，多数帧走这条）→ ② 主动集投影牛顿（乘子检查逐个移出）→ ③ 带盒截断的坐标下降兜底，并取目标最优者。这样 100 帧 trot 全收敛，mean `0.53 ms`。
+- **边界/待办**：姿态通道用「冻结的 ZYX 欧拉角速率矩阵」线性化并忽略 `ω×Iω` 时变（预测用当前值近似），只在 `±10°`/`ω<2 rad/s` 包线内可信；足端作用点在时域内视为不动（标准 SRBD 假设）；权重是初值，S9/S10 用 7 段 A/B 整定；`SrbdMpcOutput` 目前只输出第 0 节点逐脚力（节点 1..N-1 的 λ 仅用于热启动，未对外暴露）。
 
 ### S5 状态估计（✅ 已通过）
 

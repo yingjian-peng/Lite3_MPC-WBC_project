@@ -69,12 +69,26 @@ cmake --build build -j
 
 ### MPC+WBC 开发对表（可选）
 
-MPC+WBC 算法位于 `mpc_wbc/`，当前已完成运动学（FK/IK/雅可比）、全身动力学（`M/h/Jc`）、trot 步态/足端轨迹、位置环基线（S4）与状态估计（S5）。开启对表测试后可用 CTest 跑 MuJoCo 数值对照（需要 `python3` 与 `mujoco`）：
+MPC+WBC 算法位于 `mpc_wbc/`，当前已完成运动学（FK/IK/雅可比）、全身动力学（`M/h/Jc`）、trot 步态/足端轨迹、位置环基线（S4）、状态估计（S5）、SRBD 预测时域 MPC（S6）与统一 Weighted-QP WBC（S7，含自研内点法 QP 求解器）。开启对表测试后可用 CTest 跑 MuJoCo 数值对照（需要 `python3` 与 `mujoco`）：
 
 ```bash
 cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON
 cmake --build build -j
 cd build && ctest -R mpc_wbc --output-on-failure
+```
+
+SRBD-MPC 离线自检（不需要 MuJoCo）：
+
+```bash
+cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON
+cmake --build build -j
+mpc_wbc/test/run_srbd_mpc_test.sh
+```
+
+Weighted-QP WBC 离线自检 + MuJoCo 正动力学复核（自研 QP 单测 → WBC 自检 → 把解回灌 MuJoCo）：
+
+```bash
+mpc_wbc/test/run_wbc_test.sh
 ```
 
 位置环跑步基线（无头仿真 + 自动分析）：
