@@ -22,12 +22,17 @@ PRINT_DEBUG = os.environ.get("SIM_DEBUG", "1") != "0"
 SIM_LOG = os.environ.get("SIM_LOG", "")            # 可选：把状态写为 CSV
 SIM_LOG_EVERY = int(os.environ.get("SIM_LOG_EVERY", "10"))
 SIM_DURATION = float(os.environ.get("SIM_DURATION", "0"))  # >0 时到点自动退出
+SIM_INIT_YAW = float(os.environ.get("SIM_INIT_YAW", "0"))  # 初始航向（rad，绕世界 z）
 DT = 0.001
 RENDER_INTERVAL = 10
 
 URDF_INIT = {
     "lite3": np.array([0, -1.35453, 2.54948] * 4, dtype=np.float32)
 }
+
+# S9 诊断日志用：足端 body（顺序与 mpc_wbc 的腿序 FL, FR, HL, HR 一致）
+FOOT_BODY_NAMES = ("FL_FOOT", "FR_FOOT", "HL_FOOT", "HR_FOOT")
+kNumFeet = len(FOOT_BODY_NAMES)
 
 class MuJoCoSimulation:
     def __init__(self, model_key: str = MODEL_NAME, 
@@ -72,6 +77,7 @@ class MuJoCoSimulation:
         self.last_base_linvel = np.zeros((3, 1), np.float64)
         self.timestamp = 0.0
         self.last_print_time = 0  # Track last print time
+        self._foot_body_to_leg = None  # 足端 body id → 腿序号（首次写日志时构建）
 
         print(f"[INFO] MuJoCo model loaded, dof = {self.dof_num}")
 
@@ -91,6 +97,8 @@ class MuJoCoSimulation:
         """Set joint positions to match PyBullet initial angles."""
         qpos0 = self.data.qpos.copy()
         qpos0[7:7+self.dof_num] = URDF_INIT[key]
+        if SIM_INIT_YAW != 0.0:  # S9：起始航向（只改基座偏航，姿态仍水平）
+            qpos0[3:7] = [np.cos(0.5 * SIM_INIT_YAW), 0.0, 0.0, np.sin(0.5 * SIM_INIT_YAW)]
         self.data.qpos[:] = qpos0
         mujoco.mj_forward(self.model, self.data)
 
@@ -129,15 +137,53 @@ class MuJoCoSimulation:
         print(f"{Fore.MAGENTA}[Joint Cmd] Final Torq:{Style.RESET_ALL} {format_array(self.input_tq.T.flatten())}")
         print(f"{Fore.CYAN}==================={Style.RESET_ALL}")
 
+    def _foot_contact_force_world(self):
+        """逐足世界系接触力（累加该足 geom 参与的所有接触）+ 全部接触合力。
+
+        返回 (f_feet(4,3), f_all(3))。腿部顺序 FL, FR, HL, HR。
+        注意：Lite3 的 `*_SHANK_collision` geom 在名义站姿（h=0.33）下也会压在地面上
+        （实测四条小腿各承 ~25 N，而足端只有 ~0.1 N），所以「谁在承重」不能只看足端。
+        """
+        f = np.zeros((kNumFeet, 3))
+        f_all = np.zeros(3)
+        if self._foot_body_to_leg is None:
+            self._foot_body_to_leg = {}
+            for leg, name in enumerate(FOOT_BODY_NAMES):
+                body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+                if body_id >= 0:
+                    self._foot_body_to_leg[body_id] = leg
+        res = np.zeros(6, dtype=np.float64)
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            mujoco.mj_contactForce(self.model, self.data, i, res)
+            # 接触坐标系的行向量即世界系基向量（第 0 行为法向）→ world = frame.T @ local
+            f_world = c.frame.reshape(3, 3).T @ res[:3]
+            f_all += f_world
+            leg = self._foot_body_to_leg.get(self.model.geom_bodyid[c.geom1])
+            if leg is None:
+                leg = self._foot_body_to_leg.get(self.model.geom_bodyid[c.geom2])
+            if leg is not None:
+                f[leg] += f_world
+        return f, f_all
+
     def _write_log(self, f):
-        """写一行诊断日志：时间、基座位姿/速度、关节位置/速度、命令位置与 kp。"""
+        """写一行诊断日志：时间、基座位姿/速度、关节位置/速度、命令位置与 kp、力矩、足端接触与位置。"""
         base = self.data.qpos[0:7]
         v = self.data.qvel[0:3]
         w = self.data.qvel[3:6]
         q = self.data.qpos[7:7 + self.dof_num]
         dq = self.data.qvel[6:6 + self.dof_num]
+        # input_tq = PD+ff 的计算值（未限幅）；actuator_force = ctrlrange 夹取后真正作用的力矩
+        tau_cmd = np.asarray(self.input_tq, dtype=np.float64).flatten()
+        tau_act = np.asarray(self.data.actuator_force, dtype=np.float64).flatten()
+        foot_force, all_force = self._foot_contact_force_world()
+        foot_pos = np.array([
+            self.data.body(name).xpos for name in FOOT_BODY_NAMES
+        ], dtype=np.float64)
         vals = [self.timestamp, *base, *v, *w, *q, *dq,
-                *self.pos_cmd.flatten(), *self.kp_cmd.flatten()]
+                *self.pos_cmd.flatten(), *self.kp_cmd.flatten(),
+                *tau_cmd, *tau_act, *all_force.flatten(),
+                *foot_force.flatten(), *foot_pos.flatten()]
         f.write(",".join(f"{x:.6g}" for x in vals) + "\n")
         f.flush()
 
@@ -154,7 +200,12 @@ class MuJoCoSimulation:
                     + [f"q{i}" for i in range(self.dof_num)]
                     + [f"qd{i}" for i in range(self.dof_num)]
                     + [f"qcmd{i}" for i in range(self.dof_num)]
-                    + [f"kp{i}" for i in range(self.dof_num)])
+                    + [f"kp{i}" for i in range(self.dof_num)]
+                    + [f"tau{i}" for i in range(self.dof_num)]      # PD+ff 计算值（未限幅）
+                    + [f"atau{i}" for i in range(self.dof_num)]     # ctrlrange 夹取后实际力矩
+                    + ["fxall", "fyall", "fzall"]                   # 全部接触合力（世界系）
+                    + [f"f{x}{leg}" for leg in range(kNumFeet) for x in ("x", "y", "z")]
+                    + [f"p{x}{leg}" for leg in range(kNumFeet) for x in ("x", "y", "z")])
             log_f.write(",".join(cols) + "\n")
             log_f.flush()
             print(f"[INFO] logging to {SIM_LOG}")

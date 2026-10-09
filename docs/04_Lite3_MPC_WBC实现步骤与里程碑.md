@@ -201,11 +201,16 @@ flowchart TD
 
 #### S9 MuJoCo 运动验证 / A/B（对应 P7，理论 6.2）
 - **目标**：7 段自动 A/B（对照 S4 位置环基线与 ONNX），量化力控收益。
-- **交付**：测试脚本/runner（如 `state_machine/auto_test_runner.hpp` 或等价 Python 脚本）。
-- **第一项（由 S8 移交，须先做完再进入 A/B 对照）**：**trot 行走稳定性**。S8 实测包线：站立 20 s 稳定，行走 0.49–0.77 m 后失稳（`walk_fwd` 1.8–2.6 s）或在 `stop1`（命令回零）0.54 s 后失稳；失稳特征 = MPC 迭代 0 → 75/2100、残差 1e-14 → 6e-5、`Σfz` 峰值 1.9 mg、`|τ_ff|` 打到限幅、估计 `num_support` 掉到 1。候选方向（§7 待决策第 6 项）：支撑集时变（估计 `num_support` 1↔4 抖动）、落脚点/抬脚高度、MPC 退化点的数值处理、落足冲击与无滑硬约束的冲突。
+- **交付（试验台已在 S9 第一步搭好）**：
+  - 场景库 [`mpc_wbc/test/scenarios/`](../mpc_wbc/test/scenarios/)：`stand`、`axis_fwd/back/left/right`、`axis_fwd_long`、`turn_left/right`、`mix_diag`、`mix_yaw_fwd`、`stop_reverse`、`all_axes`、`heading_90`。文件只含**运动段**（`phase,duration,vx,vy,wz`），起立段由各 harness 自己拼 → 两条路径起点都是站姿、命令序列与时序一致。
+  - 场景解析 [`mpc_wbc/apps/scenario_io.hpp`](../mpc_wbc/apps/scenario_io.hpp)，两个 harness 共用（`S8_PHASES=<file>` / `S9_SCENARIO=<file>`），内置预设保持原样以不破坏 S4/S8 已记录的结果。
+  - 统一分析器 [`mpc_wbc/test/analyze_s9_run.py`](../mpc_wbc/test/analyze_s9_run.py)：逐段（命令帧内）位移/速度/角速度、姿态、力矩饱和占比、足端滑移、跌倒时刻；MPC 侧附求解侧指标。输出 JSON。
+  - 试验台 [`mpc_wbc/test/run_s9_ab.sh`](../mpc_wbc/test/run_s9_ab.sh) + 报告 [`s9_ab_report.py`](../mpc_wbc/test/s9_ab_report.py) → `build/s9/report.md`。
+  - 仿真日志扩列（`SIM_LOG`）：逐关节 `tau{i}`（PD+ff 未限幅）/`atau{i}`（限幅后实际力矩）、`fxall/fyall/fzall`（全部接触合力）、逐足接触力与足心位置；`SIM_INIT_YAW` 支持起始航向。**同时关闭 §7 第 5 项决策**（已能同时看到 `data.ctrl` 语义的未限幅值与夹取后实际值）。
 - **场景**：平地单轴六方向、混合命令、停步/换向、不同起始航向。
 - **通过条件**：不跌倒；速度符号与命令一致；无持续力矩饱和；记录轨迹、姿态、足端滑移、峰值力矩、求解时延，并与基线比较。
-- **风险**：必须用**相同起点/地面/命令序列/日志格式**对照，否则比较无意义。
+- **风险**：必须用**相同起点/地面/命令序列/日志格式**对照，否则比较无意义 —— 已由「共用场景文件 + 同一个仿真 + 同一套分析口径」约束住。
+- **第一步（本步已完成）**：把试验台本身做扎实（可复现、可比、能自动出对照表），**行走稳定性的治疗放在下一步**，免得在口径不稳的情况下调参。
 
 #### S10 工程化打磨（对应 M5）
 - **目标**：提频、载荷分配、参考系与残余振荡。
@@ -271,7 +276,7 @@ flowchart TD
 | S6 | SRBD preview MPC | S3,S5 | ✅ 通过（见 §8） |
 | S7 | Weighted-QP WBC | S2,S5,S6 | ✅ 通过（见 §8） |
 | S8 | 控制器编排 + 状态机线程 | S4,S6,S7 | ✅ 通过（编排/线程/安全退化/站立；行走稳定性移交 S9，见 §8） |
-| S9 | MuJoCo 运动验证 / A/B | S8 | 🟨 待启动（第一项：trot 行走稳定性，已带实测数据） |
+| S9 | MuJoCo 运动验证 / A/B | S8 | 🟨 进行中（试验台已就绪：场景库 + 统一分析器 + `build/s9/report.md`；下一步治 trot 行走稳定性） |
 | S10 | 工程化打磨 | S9 | ⬜ 未开始 |
 | S11 | 真机迁移 | S9,S10 | ⬜ 未开始 |
 
@@ -285,7 +290,7 @@ flowchart TD
 2. **接触估计来源**（S5 前）：计划支撑相 + 运动学残差是否足够；是否需要为 MuJoCo 增加向后兼容的真值诊断通道。
 3. **姿态通道级别**（S6 前）：~~先做「只预测质心 p/v」的验收版，还是直接上「质心 + 姿态」完整版。~~ → **已定：直接上完整版**（状态 `[p,v,rpy,ω]`，输出逐脚力 + 净力/净力矩），见 §8 S6。
 4. **状态/按键复用**（S8 前）：是否保留 `RLControlMode=6` 数值与按键语义（首版建议保留）。
-5. **仿真力矩语义**（S7/S9 前）：记录 `data.ctrl` 与限幅后 `actuator_force`/`qfrc_actuator`，确认实际输出力矩。
+5. **仿真力矩语义**（S7/S9 前）：~~记录 `data.ctrl` 与限幅后 `actuator_force`/`qfrc_actuator`，确认实际输出力矩。~~ → **已解决**（S9 试验台）：`SIM_LOG` 同时记录逐关节 `tau{i}`（`kp(qd−q)+kd(dq_d−dq)+τ_ff` 的未限幅计算值）与 `atau{i}`（`data.actuator_force`，即 `ctrlrange ±30` 夹取后**真正作用**的力矩），并另记 `fxall/fyall/fzall` 与逐足接触力/足心位置。实测站立段两者一致（`|τ|max = 6.8 N·m`，未触限）。注意 `SimulationInterface::GetJointTorque()` 回传的是**指令**力矩（仿真把 `input_tq` 原样塞回数据包，`mujoco_simulation.py` 的 `_send_robot_state`），不是实测值，所以判限幅只能用日志里的 `atau{i}`。
 6. **trot 行走不稳的切入路线**（S9 第一项，须先定）：候选按「先排除外因、再动结构」排序 —— ① 支撑集时变：估计 `num_support` 在 1↔4 间抖动，先查是步态接触计划与测量不符、还是估计器残差阈值太松（S5 的已知缺口：`GetContactForce()` 恒零）；② 落脚点/抬脚高度（`抬脚 0.06 m`、`duty 0.68`）是否够避开落足冲击；③ MPC 退化点（`BoxQp` 2100 次迭代、残差 6e-5）如何保证「宁可不说」——失败时的降级策略已定为归零 `a_des`，但要确认归零本身是否成为激励源；④ 落足冲击 × 无滑硬约束的冲突（参考工程遗留同类问题）。
 
 ---
@@ -331,6 +336,41 @@ flowchart TD
   - 参考工程 docs/03 §12.4/§12.5 记录过同类未解决问题（fwd 段 roll 极限环，疑为触地冲击 × 无滑硬约束耦合）——本工程复现了同一现象，故不再在 S8 内继续试参数。
   - **状态机路径的起立→MPC 交棒是按时间**（[`standup_state.hpp:140`](../state_machine/standup_state.hpp:140) 的 `2*stand_duration_`），没有收敛判据，与坑 7 同类；S9 一并处理。
   - `w_base/w_swing`、PD scale、步态 `T/duty/抬脚` 均未在闭环整定；1 kHz 单帧仍有 0.17–0.21% 帧超时（OS 抢占，真机需 RT 优先级）。
+
+### S9 MuJoCo 运动验证 / A/B（🟨 试验台 ✅ 就绪，第一次全场景测量已出）
+
+- **交付**：
+  - 场景库 [`mpc_wbc/test/scenarios/`](../mpc_wbc/test/scenarios/) + 解析 [`mpc_wbc/apps/scenario_io.hpp`](../mpc_wbc/apps/scenario_io.hpp)（两个 harness 共用）：`stand`、`axis_fwd/back/left/right`、`axis_fwd_long`、`turn_left/right`、`mix_diag`、`mix_yaw_fwd`、`stop_reverse`、`all_axes`、`heading_90`。
+  - 统一分析器 [`analyze_s9_run.py`](../mpc_wbc/test/analyze_s9_run.py)、试验台 [`run_s9_ab.sh`](../mpc_wbc/test/run_s9_ab.sh)、报告 [`s9_ab_report.py`](../mpc_wbc/test/s9_ab_report.py)。
+  - 仿真侧（`mujoco_simulation.py`）：日志扩列（逐关节未限幅 `tau{i}` / 限幅后 `atau{i}` / 全部接触合力 / 逐足接触力与足心位置）+ `SIM_INIT_YAW`；关掉 §7 第 5 项决策（力矩语义）。
+- **比较口径（"比较有意义"的前提）**：同一份场景文件、每条试验单独起停同一个仿真（`SIM_DURATION` 按场景算、`SIM_INIT_YAW` 控起始航向）、同一套分析器按**命令帧**比对（世界位移/速度按段起始偏航旋转到机体系，与起始航向无关）。分析器只看 `phases.csv` 里第 N 行之后的运动段（基线 3 行 / MPC 4 行），**按行号**跳过起立段而不是按名字（两边起立段名字与时长都不同）。日志可离线重分析（改口径不用重跑仿真）。
+- **判据**：跌倒（`tilt > 25°` 或 `bz < 0.15`）、方向符号、速度/角速度跟踪（`max(0.08, 40%)`）、停步段速度衰减（后 1/3 平均 |v| ≤ 0.12 m/s）、力矩饱和帧占比（`|τ| ≥ 0.95·30`，> 10% 记问题）、足端滑移（几何接触判据）。MPC 侧附 `step_ms/mpc_ms/迭代数/a_des 被清零占比/支撑数`。
+- **第一次全场景测量（各跑一次；`build/s9/report.md`）**：
+
+| 场景 | baseline（S4 位置环） | MPC+WBC | MPC 侧首个问题 |
+| --- | --- | --- | --- |
+| stand | PASS | PASS | — |
+| axis_fwd | PASS（0.212 m，tilt 2.2°，v_err 0.07） | **FAIL** | 走 0.526 m 后跌（tilt 70°，v_err 0.22） |
+| axis_back | PASS | **FAIL** | 跌（tilt 51°） |
+| axis_left | PASS | PASS | — |
+| axis_right | PASS | PASS | — |
+| axis_fwd_long（6 s） | PASS（0.451 m） | PASS（0.754 m，tilt 21.6°） | — |
+| turn_left | **FAIL**（偏航速率误差 0.12 rad/s） | PASS | — |
+| turn_right | PASS | PASS | — |
+| mix_diag | **FAIL** | PASS（两段各 0.3 m，tilt ≤ 1.5°） | 基线起立段 tilt 45° |
+| mix_yaw_fwd | PASS | **FAIL** | `stop` 段停不住（|v|=1.16 m/s）、力矩饱和 70% |
+| stop_reverse | PASS | **FAIL** | `stop_a` 停不住（|v|=0.54 m/s） |
+| all_axes | PASS | **FAIL** | `walk_fwd` 跌（tilt 61°） |
+
+  合计：baseline 10 PASS / 2 FAIL，MPC+WBC 6 PASS / 6 FAIL。
+- **本次测量给出的可执行结论（下一步治 trot 的入口）**：
+  1. **SRBD-MPC 在行走中大量退化**：站立时 `mpc_iters = 0`（命中「无约束解已可行」快速返回）、`a_des` 清零帧 0%；一走路就变成 `mpc_iters` 打到上限 2100、`mpc_ms` max 约 32 ms、**`a_des` 被清零的帧占 2.6%–32%**、`num_support` 掉到 1。力参考断续 = WBC 在"有力参考"和"只靠 PD/姿态"之间来回切，这是最可疑的失稳根因（先修它，再谈参数）。
+  2. **停步/换向是 MPC 侧最脆弱的时刻**：`stop_reverse`、`mix_yaw_fwd` 的零命令段出现停不住 + 力矩饱和（70%），而 baseline 在同样段落 PASS。
+  3. **跟踪与稳定性的取舍**：MPC 侧走得更快更远（`axis_fwd` 3 s：0.526 m ≈ 0.17 m/s；baseline 只 0.212 m ≈ 0.07 m/s）却更容易翻——不是"走不动"，是"走过头"。
+  4. **单次 PASS/FAIL 不足为凭**：`axis_fwd`（3 s）失败、`axis_fwd_long`（6 s，同命令同起点）成功 → 属边际稳定。后续治疗必须**多次重复**（试验台已支持同一场景重复跑），把 PASS 率作为指标。
+  5. baseline 自身也有短板（`mix_diag` 起立段 tilt 45°、`turn_left` 偏航速率误差），所以 A/B 结论要按相位看，不能整体下"谁更好"。
+
+
 
 ### S1 运动学 FK / IK / 雅可比（✅ 已通过）
 

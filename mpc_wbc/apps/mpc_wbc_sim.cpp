@@ -21,6 +21,7 @@
 #include "simulation/simulation_interface.hpp"
 
 #include "05_mpc_wbc_controller.hpp"
+#include "scenario_io.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -97,6 +98,7 @@ int main(int argc, char** argv) {
     }
 
     const std::string phase_set = std::getenv("S8_PHASES") ? std::getenv("S8_PHASES") : "walk";
+    // 起立段（两阶段，与 StandUpState 等价）在所有场景里都一样 → 保证两条路径"起点"相同
     std::vector<Phase> phases = {
         {"settle", 0.8, {0.0, 0.0, 0.0}},   // 自由落地，无扭矩
         {"fold", 1.5, {0.0, 0.0, 0.0}},     // 起立阶段 1：收腿到 h=pre_height（等价 StandUpState）
@@ -116,6 +118,24 @@ int main(int argc, char** argv) {
                   {"fold", 1.5, {0.0, 0.0, 0.0}},
                   {"raise", 1.5, {0.0, 0.0, 0.0}},
                   {"hold", 20.0, {0.0, 0.0, 0.0}}};
+    } else if (scenario_io::LooksLikePath(phase_set)) {
+        // S9 A/B：从场景文件读运动段（与 S4 基线共用同一份命令序列）
+        std::vector<scenario_io::Item> items;
+        std::string err;
+        if (!scenario_io::Load(phase_set, &items, &err)) {
+            std::fprintf(stderr, "[s8] %s\n", err.c_str());
+            return 2;
+        }
+        phases.resize(4);  // 保留 settle/fold/raise/hold，换掉 hold 时长
+        phases[3].duration = 0.5;
+        for (const auto& it : items)
+            phases.push_back({it.name, it.duration, {it.vx, it.vy, it.wz}});
+        std::printf("[s8] scenario %s: %zu motion phases, total %.1f s\n", phase_set.c_str(),
+                    items.size(), [&] {
+                        double s = 0.0;
+                        for (const auto& p : phases) s += p.duration;
+                        return s;
+                    }());
     }
     double total_duration = 0.0;
     for (const auto& p : phases) total_duration += p.duration;

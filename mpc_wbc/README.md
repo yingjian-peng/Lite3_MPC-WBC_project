@@ -48,6 +48,11 @@
 | `test/check_wbc_hover_mujoco.py` | S7 独立复核：把 WBC 解（`q/qvel/qdd/f/τ/stance`）回灌 MuJoCo（`ctrl=τ` + `mj_applyFT` 施加逐脚接触力），验证 `qacc≈qdd`、支撑无滑、摆动 `f=0`。 |
 | `test/lite3_controller_test.cpp` | S8 离线自检（8 段，不需要 MuJoCo）：起立退让（`τ_ff≡0`）、使能滞回、安全退化、MPC 过期降级、命令平滑、MPC 抖动不阻塞 1 kHz 路径、`τ_ff` 反解、连续失败兜底。 |
 | `test/run_s8_mpc_wbc.sh` | S8 验收：离线自检（默认）+ 可选整机 harness（`stand` / `walk`）。 |
+| `apps/scenario_io.hpp` | S9 场景文件解析（`phase,duration,vx,vy,wz`），两个 harness 共用 → 命令序列完全一致。 |
+| `test/scenarios/*.csv` | S9 场景库：`stand`、`axis_fwd/back/left/right`、`axis_fwd_long`、`turn_left/right`、`mix_diag`、`mix_yaw_fwd`、`stop_reverse`、`all_axes`、`heading_90`（配合 `SIM_INIT_YAW`）。只含运动段，起立段由各 harness 自己拼。 |
+| `test/analyze_s9_run.py` | S9 统一分析器：逐段（命令帧内）位移/速度、姿态、力矩饱和、足端滑移、MPC 求解侧指标；输出 JSON + 退出码。 |
+| `test/run_s9_ab.sh` | S9 A/B 试验台：同一场景 × {S4 位置环, S8 MPC+WBC}，同仿真、同分析口径 → `build/s9/report.md`。 |
+| `test/s9_ab_report.py` | 把 `build/s9/*.json` 汇成对照表。 |
 | `test/run_s4_position_loop.sh` + `analyze_s4_log.py` | S4 验收：无头仿真 + 位置环程序 + 日志分析。 |
 | `test/run_*_test.sh` | 一键编译 + 运行各自测试/验证（独立于 CMake）。 |
 
@@ -109,7 +114,32 @@ S8_PHASES=stand ./build/mpc_wbc/mpc_wbc_mpc_wbc_sim build/s8_phases.csv build/s8
 python3 mpc_wbc/test/analyze_s4_log.py build/s8_sim.csv build/s8_phases.csv
 ```
 
-`mpc_wbc_sim` 的环境变量：`S8_PHASES=stand|walk`、`S8_PD_SCALE`、`S8_W_SWING`、`S8_MPC_PERIOD`、`S8_HYST`、`S8_CMD_SCALE`；诊断 CSV 列含义见 `apps/mpc_wbc_sim.cpp` 的表头（`step_ms/mpc_ms/wbc_iters/eom_res/cone_viol/a_des/alpha_des/num_support/wrench_age` 等）。**harness 交棒是条件式**（关节误差 < 0.15 rad、tilt < 0.2 rad；超 1.5 s 宽限则报「起立未收敛」退出），避免在半蹲状态把控制权交给 MPC 而误判成"控制律不稳"。
+`mpc_wbc_sim` 的环境变量：`S8_PHASES=stand|walk|<scenario.csv>`、`S8_PD_SCALE`、`S8_W_SWING`、`S8_MPC_PERIOD`、`S8_HYST`、`S8_CMD_SCALE`；诊断 CSV 列含义见 `apps/mpc_wbc_sim.cpp` 的表头（`step_ms/mpc_ms/wbc_iters/eom_res/cone_viol/a_des/alpha_des/num_support/wrench_age` 等）。**harness 交棒是条件式**（关节误差 < 0.15 rad、tilt < 0.2 rad；超 1.5 s 宽限则报「起立未收敛」退出），避免在半蹲状态把控制权交给 MPC 而误判成"控制律不稳"。
+
+### 运行 S9 A/B 试验台（位置环基线 vs MPC+WBC）
+
+```bash
+mpc_wbc/test/run_s9_ab.sh                     # 全部场景 × 两条路径 →
+                                              #   build/s9/report.md（对照表）
+mpc_wbc/test/run_s9_ab.sh --only axis_fwd     # 单个场景
+mpc_wbc/test/run_s9_ab.sh --mpc --only axis_fwd_long
+mpc_wbc/test/run_s9_ab.sh --only axis_fwd --init-yaw 1.5707963   # 起始航向 90°
+```
+
+试验台约定（这是"比较有意义"的前提）：
+
+- **同一份场景文件**：`mpc_wbc/test/scenarios/*.csv`（只有运动段）由两条路径各自读取；起立段各用自己的一套（基线 `settle/stand/hold`、MPC `settle/fold/raise/hold`），保证**起点都是站姿**、命令序列与时序完全一致。
+- **同一个仿真**：`SIM_DURATION` 由 runner 按场景时长算好，`SIM_INIT_YAW` 控制起始航向；每条试验单独起停一次仿真，避免端口串台。
+- **同一套口径**：`analyze_s9_run.py` 只看 `phases.csv` 里第 N 行之后的运动段（基线 3 行 / MPC 4 行），把世界位移与速度按**段起始偏航**旋转到机体系再与段命令比对，因此与起始航向无关。
+- 判据：跌倒（`tilt > 25°` 或 `bz < 0.15`）、方向符号、速度/角速度跟踪（容差 `max(0.08, 40%)`）、
+  停步段速度衰减、力矩饱和占比（`|τ| ≥ 0.95·30 N·m` 的帧占比，> 10% 记问题）、足端滑移（几何接触判据）。
+- MPC 侧额外记录求解侧指标（`step_ms` p99/max、`mpc_ms`、迭代数、`a_des` 被清零帧占比、支撑数最小值）。
+
+> 仿真日志（`SIM_LOG`）为配合 S9 A/B 扩了列：逐关节 `tau{i}`（PD+ff 计算值，未限幅）、`atau{i}`
+> （`ctrlrange` 夹取后**实际**力矩）、`fxall/fyall/fzall`（全部接触合力）、逐足 `f*{leg}`/`p*{leg}`
+> （世界系接触力与足心位置）。旧脚本按列名读取，不受影响。
+> 注意：MuJoCo 名义站姿下 `*_SHANK_collision` 也压在地面上（实测四条小腿各承约 25 N、足端仅约 0.1 N），
+> 所以足端滑移用几何判据（足心 z < 足半径 + 4 mm）而不是"足端接触力 > 0"。
 
 ### S1 对表结果（500 个随机位姿，覆盖真实关节范围）
 

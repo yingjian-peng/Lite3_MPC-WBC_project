@@ -14,12 +14,14 @@
 
 #include "00_lite3_model.hpp"
 #include "02_gait_trajectory.hpp"
+#include "scenario_io.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,6 +41,41 @@ struct Phase {
 double SmoothStep(double x) {
     x = std::max(0.0, std::min(1.0, x));
     return x * x * (3.0 - 2.0 * x);
+}
+
+/// 起立段固定为 settle/stand/hold（与 S8 harness 的 settle/fold/raise/hold 等价分工），
+/// 之后接运动段：默认内置六方向序列，或 S9_SCENARIO 指定的场景文件（与 MPC 侧同一份）。
+std::vector<Phase> BuildPhases() {
+    std::vector<Phase> p = {
+        {"settle", 0.8, {0.0, 0.0, 0.0}},
+        {"stand", 1.5, {0.0, 0.0, 0.0}},
+        {"hold", 1.0, {0.0, 0.0, 0.0}},
+    };
+    const char* scenario = std::getenv("S9_SCENARIO");
+    if (scenario != nullptr && scenario_io::LooksLikePath(scenario)) {
+        std::vector<scenario_io::Item> items;
+        std::string err;
+        if (!scenario_io::Load(scenario, &items, &err)) {
+            std::fprintf(stderr, "[s4] %s\n", err.c_str());
+            std::exit(2);
+        }
+        p[2].duration = 0.5;
+        for (const auto& it : items) p.push_back({it.name, it.duration, {it.vx, it.vy, it.wz}});
+        std::printf("[s4] scenario %s: %zu motion phases\n", scenario, items.size());
+        return p;
+    }
+    const std::vector<Phase> builtin = {
+        {"walk_fwd", 3.0, {0.15, 0.0, 0.0}},
+        {"stop1", 0.8, {0.0, 0.0, 0.0}},
+        {"walk_back", 3.0, {-0.15, 0.0, 0.0}},
+        {"stop2", 0.8, {0.0, 0.0, 0.0}},
+        {"walk_left", 3.0, {0.0, 0.12, 0.0}},
+        {"stop3", 0.8, {0.0, 0.0, 0.0}},
+        {"turn", 3.0, {0.0, 0.0, 0.3}},
+        {"stop4", 0.8, {0.0, 0.0, 0.0}},
+    };
+    p.insert(p.end(), builtin.begin(), builtin.end());
+    return p;
 }
 
 }  // namespace
@@ -64,19 +101,7 @@ int main(int argc, char** argv) {
     GaitTrajectory gait;
     const Vec12d stand = Lite3Model::DefaultStandJointAngles();
 
-    const std::vector<Phase> phases = {
-        {"settle", 0.8, {0.0, 0.0, 0.0}},
-        {"stand", 1.5, {0.0, 0.0, 0.0}},
-        {"hold", 1.0, {0.0, 0.0, 0.0}},
-        {"walk_fwd", 3.0, {0.15, 0.0, 0.0}},
-        {"stop1", 0.8, {0.0, 0.0, 0.0}},
-        {"walk_back", 3.0, {-0.15, 0.0, 0.0}},
-        {"stop2", 0.8, {0.0, 0.0, 0.0}},
-        {"walk_left", 3.0, {0.0, 0.12, 0.0}},
-        {"stop3", 0.8, {0.0, 0.0, 0.0}},
-        {"turn", 3.0, {0.0, 0.0, 0.3}},
-        {"stop4", 0.8, {0.0, 0.0, 0.0}},
-    };
+    const std::vector<Phase> phases = BuildPhases();
     double total_duration = 0.0;
     for (const auto& p : phases) total_duration += p.duration;
 
