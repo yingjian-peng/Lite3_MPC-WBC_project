@@ -262,7 +262,7 @@ flowchart TD
 | --- | --- | --- | --- |
 | S0 | 约定冻结与骨架搭建 | — | ✅ 约定冻结 + CMake target 接入 |
 | S1 | 运动学 FK/IK/雅可比 + 对表 | S0 | ✅ 通过（见 §8） |
-| S2 | 全身动力学 M/h/Jc + 对表 | S1 | ⬜ 未开始 |
+| S2 | 全身动力学 M/h/Jc + 对表 | S1 | ✅ 通过（见 §8） |
 | S3 | 步态与足端轨迹 | S2 | ⬜ 未开始 |
 | S4 | 位置环跑步（基线平台） | S3 | ⬜ 未开始 |
 | S5 | 状态估计 | S2,S4 | ⬜ 未开始 |
@@ -312,14 +312,41 @@ flowchart TD
   - 触地/接触雅可比要求“接触点”位置，当前 `J_all` 是球心的雅可比，S5/S7 需按需换算。
 - **构建**：对表已纳入 CMake（见 S0），可用 `ctest -R mpc_wbc` 运行。
 
+### S2 全身动力学 M(q) / h(q,qvel) / Jc（✅ 已通过）
+
+- **交付**：`mpc_wbc/00_lite3_model.hpp` 新增 `MassMatrix`、`BiasForce`、`ContactJacobianWorld`、`TotalMass`，以及刚体树参数（`BodyParams`，源自 `Lite3.xml` 的 `<inertial>`）；`mpc_wbc/test/` 新增动力学 oracle 与对表。
+- **实现要点**：
+  - `M(q)`：逐刚体动能组装 `M = Σ mᵢ·Jp_comᵢᵀ·Jp_comᵢ + Jrᵢᵀ·Iᵢᵂ·Jrᵢ`（第 3.4 节）。
+  - `h(q,qvel)`：Newton-Euler（qdd=0，重力作为基座虚拟加速度），`h = Σ Jp_comᵀ(m·a_com) + Jrᵀ(Iᵂ·α + ω×Iᵂω)`（第 3.5 节 + 附录 E）。
+  - `Jc`：球足最低点接触雅可比 `Jc = Jp_center − Skew(d)·Jr`，`d=(0,0,−foot_radius)`。
+- **对表方式**：`mpc_wbc/test/run_dynamics_test.sh 200`，200 个「随机位姿 + 随机广义速度」，真值来自 `mj_fullM` / `qfrc_bias` / `mj_jacBody`。
+
+| 项 | 误差 | 阈值 | 结果 |
+| --- | --- | --- | --- |
+| 质量矩阵 `M(q)` | `7.2e-16` | `< 1e-9` | ✅ |
+| bias `h(q,qvel)` | `5.7e-14` | `< 1e-9` | ✅ |
+| 接触雅可比 `Jc` | `5.0e-16` | `< 1e-9` | ✅ |
+| `M` 左上 3×3 = `m_total·I`（11.9376） | `0` | `< 1e-9` | ✅ |
+| `M` 不对称度 | `0` | `< 1e-9` | ✅ |
+| `M` 最小特征值 | `1.27e-3` | `> 0` | ✅ |
+
+- **过程记录（两个坑）**：
+  1. 固定刚体（`FOOT`）没有关节，遍历时若不判断 `joint_col < 0` 会对关节角数组做 `q(-1)` 越界访问 → 已在 `ComputeBodyJacobians` 用 `joint_col >= 0 ? q(col) : 0` 修正。
+  2. 最初用「球足**几何最低点**位置差分」自检 `Jc`，与模型不符：几何最低点是世界系固定偏移，速度为 `v_center`；而无滑接触约束需要的是**材料点**速度 `v_center + ω×d`。改用 `mj_jacBody` 换算的 `Jc = jacp − Skew(d)·jacr` 作为 oracle 后一致到 `5e-16`。
+- **边界/待办**：
+  - 重力作为参数传入（MuJoCo 默认 `(0,0,-9.81)`；`common_types.h` 为 `9.815`，接入时须统一）。
+  - `Jc` 只对平地法向成立；WBC 需要 `Jdot·v`，S7 补。
+
 ### S0 约定冻结与骨架（✅ 已完成）
+
+
 
 - 坐标约定、`nv=18`、`qvel` 顺序、`S` 矩阵、关节顺序等已冻结在 `00_lite3_model.hpp` 头部注释与常量中。
 - **构建接入**：
   - `mpc_wbc/CMakeLists.txt`：提供 `mpc_wbc` INTERFACE 库（`00_lite3_model.hpp` 为 header-only）与对表测试 target。
   - 根 `CMakeLists.txt`：新增选项 `BUILD_MPC_WBC_TESTS`（默认 **OFF**），并 `add_subdirectory(mpc_wbc)`；测试 ON 时调用 `enable_testing()`。
-  - 测试用 CTest fixture 组织：`mpc_wbc_gen_cases`（生成 MuJoCo 真值）→ `mpc_wbc_kinematics`（对表）。
+  - 测试用 CTest fixture 组织：`mpc_wbc_gen_kinematics_cases`→`mpc_wbc_kinematics`、`mpc_wbc_gen_dynamics_cases`→`mpc_wbc_dynamics`。
 - **验收**：
-  - `cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON && cmake --build build -j && cd build && ctest -R mpc_wbc` 两个测试通过。
-  - 默认配置（不传该选项）下 `ctest -N` 为 0 个测试、无 `lite3_kinematics_test` target，`rl_deploy` 正常构建 → **ONNX 路径不变**。
+  - `cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON && cmake --build build -j && cd build && ctest -R mpc_wbc` 4 个测试通过。
+  - 默认配置（不传该选项）下 `ctest -N` 为 0 个测试、无 `lite3_*_test` target，`rl_deploy` 正常构建 → **ONNX 路径不变**。
 

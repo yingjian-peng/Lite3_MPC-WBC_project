@@ -29,6 +29,7 @@ constexpr int kNumGenVel = 18;               // [v_world(3); omega_body(3); dq(1
 constexpr int kNumGenPos = 19;               // 浮动基 7 (xyz + quat wxyz) + 12 关节
 constexpr int kNumContactForces = 12;        // 四脚 × 3 维接触力
 constexpr int kNumActuators = 12;
+constexpr int kNumBodies = 17;               // TORSO + 4 腿 × (Hip,Thigh,Shank,Foot)
 
 enum LegIndex { kFL = 0, kFR = 1, kHL = 2, kHR = 3 };
 enum JointIndex { kHipX = 0, kHipY = 1, kKnee = 2 };
@@ -38,6 +39,8 @@ using Vec4d = Eigen::Vector4d;
 using Vec12d = Eigen::Matrix<double, kNumJoints, 1>;
 using Vec18d = Eigen::Matrix<double, kNumGenVel, 1>;
 using Mat3d = Eigen::Matrix3d;
+using Mat18d = Eigen::Matrix<double, kNumGenVel, kNumGenVel>;
+using Mat3x18d = Eigen::Matrix<double, 3, kNumGenVel>;
 using Mat12x18d = Eigen::Matrix<double, kNumContactForces, kNumGenVel>;
 using Mat3x12d = Eigen::Matrix<double, 3, kNumJoints>;
 
@@ -60,6 +63,25 @@ struct Lite3Geometry {
     // 左右镜像符号：+1 为左侧（y>0），-1 为右侧
     std::array<double, kNumLegs> side_sign = {{+1.0, -1.0, +1.0, -1.0}};
 };
+
+// ---------------------------------------------------------------------------
+// 刚体参数（S2 全身动力学）。数值来源 Lite3.xml 的 <inertial>。
+// 刚体顺序：0=TORSO；leg i(FL,FR,HL,HR) 依次为 1+4i=Hip, 2+4i=Thigh, 3+4i=Shank, 4+4i=Foot。
+// ---------------------------------------------------------------------------
+struct BodyParams {
+    int parent = -1;                    // 父刚体索引；基座为 -1
+    Vec3d offset = Vec3d::Zero();       // 相对父刚体，在父系下表达
+    int joint_col = -1;                 // dq 列索引 (0..11)；固定刚体为 -1
+    Vec3d axis = Vec3d::Zero();         // 关节轴，在本刚体系下
+    double mass = 0.0;
+    Vec3d com = Vec3d::Zero();          // 质心，在本刚体系下
+    Vec3d inertia_diag = Vec3d::Zero(); // 主轴惯量（本刚体系，inertial quat 均为单位）
+};
+
+inline constexpr int HipBodyIndex(int leg) { return 1 + 4 * leg; }
+inline constexpr int ThighBodyIndex(int leg) { return 2 + 4 * leg; }
+inline constexpr int ShankBodyIndex(int leg) { return 3 + 4 * leg; }
+inline constexpr int FootBodyIndex(int leg) { return 4 + 4 * leg; }
 
 // ---------------------------------------------------------------------------
 // 小工具
@@ -99,6 +121,19 @@ inline double WrapToPi(double a) {
     return a;
 }
 
+/// 绕单位轴 axis 旋转 angle 的旋转矩阵（Rodrigues 公式）。
+inline Mat3d AxisAngle(const Vec3d& axis, double angle) {
+    const Mat3d K = Skew(axis);
+    return Mat3d::Identity() + std::sin(angle) * K + (1.0 - std::cos(angle)) * (K * K);
+}
+
+/// 在机体系角速度 omega_body 下把旋转向前积分 dt：R <- R * Exp([omega_body] dt)。
+inline Mat3d IntegrateBodyRotation(const Mat3d& R, const Vec3d& omega_body, double dt) {
+    const double n = omega_body.norm();
+    if (n * dt < 1e-12) return R;
+    return R * AxisAngle(omega_body / n, n * dt);
+}
+
 /// 四元数 (w,x,y,z) -> 旋转矩阵 R_WB（机体系向量转到世界系）。
 inline Mat3d QuatToRotation(const Vec4d& q_wxyz) {
     const double w = q_wxyz(0), x = q_wxyz(1), y = q_wxyz(2), z = q_wxyz(3);
@@ -118,6 +153,9 @@ inline Mat3d QuatToRotation(const Vec4d& q_wxyz) {
 class Lite3Model {
 public:
     Lite3Geometry geo;
+    std::array<BodyParams, kNumBodies> bodies;
+
+    Lite3Model() { InitBodies(); }
 
     // -----------------------------------------------------------------------
     // 正运动学 FK：单腿关节角 -> 足端在机体系下的位置
@@ -233,6 +271,100 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // 全身动力学（S2）
+    //
+    // 运动方程： M(q)·qdd + h(q, qvel) = Sᵀ·τ + Jcᵀ·f
+    //   qvel = [v_world(3); omega_body(3); dq(12)]（与 MuJoCo free joint 一致）
+    //   M(q) 由逐刚体动能组装；h 由 Newton-Euler（qdd=0、重力作为基座虚拟加速度）。
+    // -----------------------------------------------------------------------
+
+    /// 全身质量矩阵 M(q)（18×18）。仅依赖关节角与基座姿态。
+    Mat18d MassMatrix(const Vec12d& q, const Mat3d& R_B) const {
+        std::array<Mat3d, kNumBodies> R;
+        std::array<Mat3x18d, kNumBodies> Jp, Jr;
+        ComputeBodyJacobians(q, R_B, &R, &Jp, &Jr);
+
+        Mat18d M = Mat18d::Zero();
+        for (int i = 0; i < kNumBodies; ++i) {
+            const BodyParams& b = bodies[i];
+            const Vec3d c_w = R[i] * b.com;
+            const Mat3x18d Jp_com = Jp[i] - Skew(c_w) * Jr[i];
+            const Mat3d I_world = R[i] * b.inertia_diag.asDiagonal() * R[i].transpose();
+            M += b.mass * Jp_com.transpose() * Jp_com + Jr[i].transpose() * I_world * Jr[i];
+        }
+        return 0.5 * (M + M.transpose());
+    }
+
+    /// bias 项 h(q, qvel)（18），含科氏/离心/重力。
+    Vec18d BiasForce(const Vec12d& q, const Vec18d& qvel, const Mat3d& R_B,
+                     const Vec3d& gravity) const {
+        std::array<Mat3d, kNumBodies> R;
+        std::array<Mat3x18d, kNumBodies> Jp, Jr;
+        ComputeBodyJacobians(q, R_B, &R, &Jp, &Jr);
+
+        // 前向递推：速度、以及 qdd=0 时的加速度。
+        std::array<Vec3d, kNumBodies> v, omega, a, alpha;
+        for (int i = 0; i < kNumBodies; ++i) {
+            const BodyParams& b = bodies[i];
+            if (b.parent < 0) {
+                v[i] = qvel.segment<3>(0);
+                omega[i] = R_B * qvel.segment<3>(3);
+                a[i] = -gravity;  // 重力作为基座虚拟线加速度
+                alpha[i] = Vec3d::Zero();
+            } else {
+                const int par = b.parent;
+                const Vec3d r = R[par] * b.offset;
+                omega[i] = omega[par];
+                alpha[i] = alpha[par];
+                if (b.joint_col >= 0) {
+                    const Vec3d axis_w = R[i] * b.axis;
+                    const double qd = qvel(6 + b.joint_col);
+                    omega[i] += axis_w * qd;
+                    alpha[i] += omega[par].cross(axis_w) * qd;
+                }
+                v[i] = v[par] + omega[par].cross(r);
+                a[i] = a[par] + alpha[par].cross(r) + omega[par].cross(omega[par].cross(r));
+            }
+        }
+
+        // 反向求和：各刚体惯性广义力之和 = C·qvel + G。
+        Vec18d h = Vec18d::Zero();
+        for (int i = 0; i < kNumBodies; ++i) {
+            const BodyParams& b = bodies[i];
+            const Vec3d c_w = R[i] * b.com;
+            const Mat3d I_world = R[i] * b.inertia_diag.asDiagonal() * R[i].transpose();
+            const Vec3d a_com =
+                a[i] + alpha[i].cross(c_w) + omega[i].cross(omega[i].cross(c_w));
+            const Vec3d N = I_world * alpha[i] + omega[i].cross(I_world * omega[i]);
+            const Mat3x18d Jp_com = Jp[i] - Skew(c_w) * Jr[i];
+            h += Jp_com.transpose() * (b.mass * a_com) + Jr[i].transpose() * N;
+        }
+        return h;
+    }
+
+    /// 四脚接触点雅可比（世界系 12×18）。接触点取球足最低点，即球心 + (0,0,-foot_radius)。
+    Mat12x18d ContactJacobianWorld(const Vec12d& q, const Mat3d& R_B) const {
+        std::array<Mat3d, kNumBodies> R;
+        std::array<Mat3x18d, kNumBodies> Jp, Jr;
+        ComputeBodyJacobians(q, R_B, &R, &Jp, &Jr);
+
+        Mat12x18d Jc;
+        const Vec3d d(0.0, 0.0, -geo.foot_radius);
+        for (int leg = 0; leg < kNumLegs; ++leg) {
+            const int f = FootBodyIndex(leg);
+            Jc.block<3, kNumGenVel>(3 * leg, 0) = Jp[f] - Skew(d) * Jr[f];
+        }
+        return Jc;
+    }
+
+    /// 所有刚体质量之和。
+    double TotalMass() const {
+        double m = 0.0;
+        for (const auto& b : bodies) m += b.mass;
+        return m;
+    }
+
+    // -----------------------------------------------------------------------
     // 默认站立关节角（docs/03 附录 C：每腿 [0, -0.65, 1.3]）
     // -----------------------------------------------------------------------
     static Vec3d DefaultStandLegAngles() { return Vec3d(0.0, -0.65, 1.3); }
@@ -240,6 +372,102 @@ public:
         Vec12d q;
         for (int leg = 0; leg < kNumLegs; ++leg) q.segment<3>(3 * leg) = DefaultStandLegAngles();
         return q;
+    }
+
+private:
+    void InitBodies() {
+        // 关节列：leg i -> 3i HipX、3i+1 HipY、3i+2 Knee
+        const Vec3d hip_axis(-1.0, 0.0, 0.0);
+        const Vec3d pitch_axis(0.0, -1.0, 0.0);
+
+        BodyParams torso;
+        torso.parent = -1;
+        torso.mass = 5.6056;
+        torso.com = Vec3d::Zero();
+        torso.inertia_diag = Vec3d(0.02456, 0.05518, 0.07016);
+        bodies[0] = torso;
+
+        // 各腿 <inertial>（Lite3.xml）。顺序 FL, FR, HL, HR。
+        const Vec3d hip_com[kNumLegs] = {
+            Vec3d(-0.00601, -0.0066532, 0.00034295),
+            Vec3d(-0.010579, 0.011358, 0.00048546),
+            Vec3d(0.010905, -0.012636, 0.001051),
+            Vec3d(0.010354, 0.011423, 0.00049498)};
+        const Vec3d hip_inertia[kNumLegs] = {
+            Vec3d(0.0003949, 0.0004028, 0.0004472),
+            Vec3d(0.0004472, 0.0004028, 0.0003949),
+            Vec3d(0.0003949, 0.0004028, 0.0004472),
+            Vec3d(0.0003949, 0.0004028, 0.0004472)};
+        const double thigh_com_y[kNumLegs] = {-0.014632, 0.014632, -0.014632, 0.014632};
+        const double shank_com_y[kNumLegs] = {-1.4535e-06, -1.4552e-06, -1.4558e-06, -1.4529e-06};
+
+        for (int leg = 0; leg < kNumLegs; ++leg) {
+            const double s = geo.side_sign[leg];
+            BodyParams b;
+
+            b.parent = 0;
+            b.offset = geo.hip_pos_body[leg];
+            b.joint_col = 3 * leg;
+            b.axis = hip_axis;
+            b.mass = 0.550;
+            b.com = hip_com[leg];
+            b.inertia_diag = hip_inertia[leg];
+            bodies[HipBodyIndex(leg)] = b;
+
+            b.parent = HipBodyIndex(leg);
+            b.offset = Vec3d(0.0, s * geo.hip_lateral, 0.0);
+            b.joint_col = 3 * leg + 1;
+            b.axis = pitch_axis;
+            b.mass = 0.86;
+            b.com = Vec3d(-0.0039245, thigh_com_y[leg], -0.025146);
+            b.inertia_diag = Vec3d(0.005736, 0.00496, 0.001436);
+            bodies[ThighBodyIndex(leg)] = b;
+
+            b.parent = ThighBodyIndex(leg);
+            b.offset = Vec3d(0.0, 0.0, -geo.thigh_len);
+            b.joint_col = 3 * leg + 2;
+            b.axis = pitch_axis;
+            b.mass = 0.153;
+            b.com = Vec3d(0.0064794, shank_com_y[leg], -0.12157);
+            b.inertia_diag = Vec3d(0.00089039, 0.00090672, 3.1266e-05);
+            bodies[ShankBodyIndex(leg)] = b;
+
+            b.parent = ShankBodyIndex(leg);
+            b.offset = Vec3d(0.0, 0.0, -geo.shank_len);
+            b.joint_col = -1;
+            b.axis = Vec3d::Zero();
+            b.mass = 0.02;
+            b.com = Vec3d::Zero();
+            b.inertia_diag = Vec3d::Zero();
+            bodies[FootBodyIndex(leg)] = b;
+        }
+    }
+
+    /// 计算各刚体的世界位姿 R 与足端/刚体雅可比 Jp（原点线速度）、Jr（角速度）。
+    void ComputeBodyJacobians(const Vec12d& q, const Mat3d& R_B,
+                              std::array<Mat3d, kNumBodies>* R,
+                              std::array<Mat3x18d, kNumBodies>* Jp,
+                              std::array<Mat3x18d, kNumBodies>* Jr) const {
+        for (int i = 0; i < kNumBodies; ++i) {
+            const BodyParams& b = bodies[i];
+            if (b.parent < 0) {
+                (*R)[i] = R_B;
+                Mat3x18d jp = Mat3x18d::Zero();
+                jp.block<3, 3>(0, 0) = Mat3d::Identity();
+                Mat3x18d jr = Mat3x18d::Zero();
+                jr.block<3, 3>(0, 3) = R_B;
+                (*Jp)[i] = jp;
+                (*Jr)[i] = jr;
+            } else {
+                const int par = b.parent;
+                const double angle = (b.joint_col >= 0) ? q(b.joint_col) : 0.0;
+                (*R)[i] = (*R)[par] * AxisAngle(b.axis, angle);
+                const Vec3d r = (*R)[par] * b.offset;
+                (*Jp)[i] = (*Jp)[par] - Skew(r) * (*Jr)[par];
+                (*Jr)[i] = (*Jr)[par];
+                if (b.joint_col >= 0) (*Jr)[i].col(6 + b.joint_col) += (*R)[i] * b.axis;
+            }
+        }
     }
 };
 

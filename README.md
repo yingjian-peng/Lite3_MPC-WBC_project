@@ -69,7 +69,7 @@ cmake --build build -j
 
 ### MPC+WBC 开发对表（可选）
 
-MPC+WBC 算法位于 `mpc_wbc/`，当前已完成运动学（FK/IK/雅可比）。开启对表测试后可用 CTest 跑 MuJoCo 数值对照（需要 `python3` 与 `mujoco`）：
+MPC+WBC 算法位于 `mpc_wbc/`，当前已完成运动学（FK/IK/雅可比）与全身动力学（`M/h/Jc`）。开启对表测试后可用 CTest 跑 MuJoCo 数值对照（需要 `python3` 与 `mujoco`）：
 
 ```bash
 cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON
