@@ -17,7 +17,11 @@ XML_PATH = "../../../robot_models/robots/Lite3/Lite3_mjcf/mjcf/Lite3_flat.xml"
 LOCAL_PORT = 20001
 CTRL_IP = "127.0.0.1"
 CTRL_PORT = 30010
-USE_VIEWER = True
+USE_VIEWER = os.environ.get("MUJOCO_VIEWER", "1") != "0"
+PRINT_DEBUG = os.environ.get("SIM_DEBUG", "1") != "0"
+SIM_LOG = os.environ.get("SIM_LOG", "")            # 可选：把状态写为 CSV
+SIM_LOG_EVERY = int(os.environ.get("SIM_LOG_EVERY", "10"))
+SIM_DURATION = float(os.environ.get("SIM_DURATION", "0"))  # >0 时到点自动退出
 DT = 0.001
 RENDER_INTERVAL = 10
 
@@ -125,10 +129,35 @@ class MuJoCoSimulation:
         print(f"{Fore.MAGENTA}[Joint Cmd] Final Torq:{Style.RESET_ALL} {format_array(self.input_tq.T.flatten())}")
         print(f"{Fore.CYAN}==================={Style.RESET_ALL}")
 
+    def _write_log(self, f):
+        """写一行诊断日志：时间、基座位姿/速度、关节位置/速度、命令位置与 kp。"""
+        base = self.data.qpos[0:7]
+        v = self.data.qvel[0:3]
+        w = self.data.qvel[3:6]
+        q = self.data.qpos[7:7 + self.dof_num]
+        dq = self.data.qvel[6:6 + self.dof_num]
+        vals = [self.timestamp, *base, *v, *w, *q, *dq,
+                *self.pos_cmd.flatten(), *self.kp_cmd.flatten()]
+        f.write(",".join(f"{x:.6g}" for x in vals) + "\n")
+        f.flush()
+
     def start(self):
         # Start UDP receiver thread
         threading.Thread(target=self._udp_receiver, daemon=True).start()
         print(f"[INFO] UDP receiver on 0.0.0.0:{self.local_port}")
+
+        log_f = None
+        if SIM_LOG:
+            log_f = open(SIM_LOG, "w")
+            cols = (["t", "bx", "by", "bz", "qw", "qx", "qy", "qz",
+                     "vx", "vy", "vz", "wx", "wy", "wz"]
+                    + [f"q{i}" for i in range(self.dof_num)]
+                    + [f"qd{i}" for i in range(self.dof_num)]
+                    + [f"qcmd{i}" for i in range(self.dof_num)]
+                    + [f"kp{i}" for i in range(self.dof_num)])
+            log_f.write(",".join(cols) + "\n")
+            log_f.flush()
+            print(f"[INFO] logging to {SIM_LOG}")
 
         # Main simulation loop
         step = 0
@@ -136,7 +165,7 @@ class MuJoCoSimulation:
         while True:
             if time.time() - last_time >= DT:
                 last_time = time.time()
-                
+
                 step += 1
                 # 控制律
 
@@ -148,15 +177,24 @@ class MuJoCoSimulation:
 
                 # 采样 & 发送观测
                 self._send_robot_state(step)
+                if log_f is not None and step % SIM_LOG_EVERY == 0:
+                    self._write_log(log_f)
                 # 可视化
                 if self.viewer and step % RENDER_INTERVAL == 0:
                     self.viewer.sync()
-                    
+
                 # Print at 0.5 Hz (every 2 seconds)
-                current_time = time.perf_counter()
-                if current_time - self.last_print_time >= 2.0:
-                    self.print_debug_info()
-                    self.last_print_time = current_time
+                if PRINT_DEBUG:
+                    current_time = time.perf_counter()
+                    if current_time - self.last_print_time >= 2.0:
+                        self.print_debug_info()
+                        self.last_print_time = current_time
+
+                if SIM_DURATION > 0 and self.timestamp >= SIM_DURATION:
+                    print(f"[INFO] reached SIM_DURATION={SIM_DURATION}s, exiting")
+                    if log_f is not None:
+                        log_f.close()
+                    return
                     
 
     def _udp_receiver(self):

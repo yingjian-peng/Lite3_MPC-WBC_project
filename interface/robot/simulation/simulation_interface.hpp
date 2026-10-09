@@ -75,8 +75,10 @@ namespace interface{
         }
 
         virtual void Stop(){
-            // start_flag_ = false;
-            // sim_thread_.join();
+            // 停止接收/发送线程并回收，避免析构时 std::thread 仍 joinable
+            start_thread_flag_ = false;
+            if (sim_thread_.joinable()) sim_thread_.join();
+            if (send_thread_.joinable()) send_thread_.join();
         }
 
         void ReceiveRobotData(){

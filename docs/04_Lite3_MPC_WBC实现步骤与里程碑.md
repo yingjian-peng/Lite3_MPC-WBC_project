@@ -263,8 +263,8 @@ flowchart TD
 | S0 | 约定冻结与骨架搭建 | — | ✅ 约定冻结 + CMake target 接入 |
 | S1 | 运动学 FK/IK/雅可比 + 对表 | S0 | ✅ 通过（见 §8） |
 | S2 | 全身动力学 M/h/Jc + 对表 | S1 | ✅ 通过（见 §8） |
-| S3 | 步态与足端轨迹 | S2 | ⬜ 未开始 |
-| S4 | 位置环跑步（基线平台） | S3 | ⬜ 未开始 |
+| S3 | 步态与足端轨迹 | S2 | ✅ 通过（见 §8） |
+| S4 | 位置环跑步（基线平台） | S3 | ✅ 通过（见 §8） |
 | S5 | 状态估计 | S2,S4 | ⬜ 未开始 |
 | S6 | SRBD preview MPC | S3,S5 | ⬜ 未开始 |
 | S7 | Weighted-QP WBC | S2,S5,S6 | ⬜ 未开始 |
@@ -336,6 +336,47 @@ flowchart TD
 - **边界/待办**：
   - 重力作为参数传入（MuJoCo 默认 `(0,0,-9.81)`；`common_types.h` 为 `9.815`，接入时须统一）。
   - `Jc` 只对平地法向成立；WBC 需要 `Jdot·v`，S7 补。
+
+### S3 步态与足端轨迹（✅ 已通过）
+
+- **交付**：`mpc_wbc/02_gait_trajectory.hpp`（`GaitParams` / `GaitCommand` / `LegGaitState` / `GaitTrajectory`）；`mpc_wbc/test/lite3_gait_trajectory_test.cpp` 自检（无需 MuJoCo）。
+- **实现要点**（理论第 2 章）：
+  - 相位 `θ(t)=frac((t-t0)/T)`、`φ_i=frac(θ+δ_i)`、`c_i=φ_i<d`；trot 偏移 `FL=HR=0, FR=HL=0.5`。
+  - 相内进度 `ξ`：支撑 `φ/d`、摆动 `(φ-d)/(1-d)`。
+  - 支撑足机体系后扫 `p = p0 + (1/2−ξ)Δp`；摆动足 `s(ξ)=10ξ³−15ξ⁴+6ξ⁵` + 抬脚 `h(ξ)=H/2(1−cos2πξ)`。
+  - 行走/停步滞回：归一化速度超 `start_threshold` 起步（`t_start` 使 θ=0，四足同时接触，可从静立平稳起走），低于 `stop_threshold` 停步并回到名义足位。
+  - `ContactSchedule<N>` 供 MPC/WBC 使用同一相位源。
+- **与文档的差异（更贴合物理一致性）**：步长用 stance 时长折算 `Δp = T_stance·(v + ω×p_foot)`，`T_stance = T·d`；docs/03 §2.2 用整周期 `T` 且旋转项用髋位置 `r_hip`，本实现用名义足位 `p_foot`（支撑足机体系速度恰为 `-(v+ω×p_foot)`，自检误差 `7.4e-12`）。
+
+| 检查 | 结果 |
+| --- | --- |
+| 零命令停步（四足静立、足位 = 名义） | ✅ |
+| 起步/停步滞回 | ✅ |
+| 六种单轴 + 混合命令：足目标可达、无越限 | ✅ |
+| 足端位置全程连续（每步 `<1.13e-4`） | ✅ |
+| 支撑相机体系速度 = `-(v+ω×p0)` | ✅ |
+| 未来支撑表与逐点接触一致 | ✅ |
+| 摆动曲线端点性质（`s(0)=0,s(1)=1,s'(0)=s'(1)=0,h(0)=h(1)=0`） | ✅ |
+
+- **过程记录（一个坑）**：最初在「所有腿都处于支撑相」的假设下检查支撑速度，但 `t=0.3 T_stance` 时后半周期腿（`FR/HL`）已进入摆动；改为按每条腿各自的支撑相中段取样后通过。
+- **边界/待办**：支撑相为机体系开环后扫（世界锚点锁定待 S5 后有基座速度估计再做）；停步为立即回名义足位（未做收步过渡）；摆动起落点与支撑相速度存在已知跳变（位置连续）。
+
+### S4 位置环跑步基线（✅ 已通过）
+
+- **交付**：`mpc_wbc/apps/position_loop_sim.cpp`（位置环控制器，UDP 连仿真）；`BUILD_MPC_WBC_SIM` 选项；`mpc_wbc/test/run_s4_position_loop.sh` + `analyze_s4_log.py` 验收脚本。为支持无头验收，`mujoco_simulation.py` 增加后向兼容的 `MUJOCO_VIEWER` / `SIM_DEBUG` / `SIM_LOG` / `SIM_DURATION` 环境变量；`SimulationInterface::Stop()` 实现线程停止与 `join`（原为空实现，导致程序退出时 `std::thread` 仍 joinable 而 abort）。
+- **控制律**：`q_des = IK(步态足端目标)`，下发 `{kp=100, q_des, kd=2.5, 0, 0}`；时间线 = 静落 → 站立斜坡（关节空间 smoothstep）→ 保持 → 前进/后退/左移/转向（各段间停步）。
+- **验收**（无头 MuJoCo 24 s，`mpc_wbc/test/run_s4_position_loop.sh 24`）：
+
+| 阶段 | Δx (m) | Δy (m) | Δyaw | max tilt | min base z |
+| --- | --- | --- | --- | --- | --- |
+| walk_fwd | `+0.186` | `0.005` | `2.2°` | `1.0°` | `0.331` |
+| walk_back | `-0.340` | `-0.013` | `-0.7°` | `2.0°` | `0.332` |
+| walk_left | `-0.137` | `+0.252` | `3.6°` | `1.5°` | `0.332` |
+| turn | `-0.127` | `-0.047` | `+34.1°` | `1.2°` | `0.332` |
+
+  站立后机身最大倾斜 `3.2°`、最低机身高 `0.331 m`，全程未跌倒、程序干净退出。
+- **过程记录**：程序首次运行在退出时 `abort`（`terminate called without an active exception`）——`SimulationInterface` 的收发线程可 join 却在析构时未回收。按 docs/02 §6 的「退出时停止并 join 工作线程」实现 `Stop()` 后解决。
+- **边界/待办**：位置环为开环、无姿态/力反馈，侧移段有少量前向漂移（`-0.137 m`）；这正是 S5–S7 要解决的问题。本步不接入 `state_machine/`，不改动 ONNX 路径。
 
 ### S0 约定冻结与骨架（✅ 已完成）
 

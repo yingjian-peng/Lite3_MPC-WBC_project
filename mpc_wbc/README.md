@@ -11,18 +11,24 @@
 | S0 | 约定冻结与骨架 | ✅ CMake target（`BUILD_MPC_WBC_TESTS`）已接入 |
 | S1 | 运动学 FK / IK / 雅可比 + MuJoCo 对表 | ✅ 通过 |
 | S2 | 全身动力学 M(q) / h(q,qvel) / Jc + MuJoCo 对表 | ✅ 通过 |
+| S3 | 步态与足端轨迹（trot + 静立） | ✅ 通过 |
+| S4 | 位置环跑步基线（MuJoCo） | ✅ 通过（见下） |
 
 ## 文件
 
 | 文件 | 说明 |
 | --- | --- |
 | `00_lite3_model.hpp` | Lite3 平地基座模型：运动学（FK / IK / 单腿与全身足端雅可比）与全身动力学（`MassMatrix` / `BiasForce` / `ContactJacobianWorld`）。 |
-| `CMakeLists.txt` | `mpc_wbc` INTERFACE 库与对表测试 target（`BUILD_MPC_WBC_TESTS`）。 |
+| `02_gait_trajectory.hpp` | trot 步态与足端轨迹：相位/支撑判据、支撑后扫、摆动五次曲线 + 余弦抬脚、停步滞回、未来支撑表。 |
+| `apps/position_loop_sim.cpp` | S4 位置环跑步程序：站立斜坡 + 步态/IK + 关节 PD，通过 UDP 与仿真通信。 |
+| `CMakeLists.txt` | `mpc_wbc` INTERFACE 库、对表/自检 target（`BUILD_MPC_WBC_TESTS`）与仿真程序（`BUILD_MPC_WBC_SIM`）。 |
 | `test/gen_mujoco_cases.py` | 运动学真值：随机位姿 + `mj_forward` / `mj_jacBody`。 |
 | `test/lite3_kinematics_test.cpp` | 比较 FK / 雅可比 / IK 回代。 |
 | `test/gen_mujoco_dynamics_cases.py` | 动力学真值：随机位姿与广义速度 + `mj_fullM` / `qfrc_bias` / `mj_jacBody`。 |
 | `test/lite3_dynamics_test.cpp` | 比较 `M(q)` / `h(q,qvel)` / `Jc`，并检查 M 的对称正定与质量块。 |
-| `test/run_kinematics_test.sh`、`test/run_dynamics_test.sh` | 一键生成 + 编译 + 运行对表（独立于 CMake）。 |
+| `test/lite3_gait_trajectory_test.cpp` | 步态自检（停步、可达性/限位、连续性、支撑速度、支撑表）。 |
+| `test/run_s4_position_loop.sh` + `analyze_s4_log.py` | S4 验收：无头仿真 + 位置环程序 + 日志分析。 |
+| `test/run_*_test.sh` | 一键编译 + 运行各自测试（独立于 CMake）。 |
 
 ## 约定（与 `docs/02` §3 一致）
 
@@ -39,6 +45,7 @@
 ```bash
 mpc_wbc/test/run_kinematics_test.sh 500
 mpc_wbc/test/run_dynamics_test.sh 200
+mpc_wbc/test/run_gait_trajectory_test.sh
 ```
 
 方式二（纳入 CMake 构建，由 CTest 管理）：
@@ -50,6 +57,16 @@ cd build && ctest -R mpc_wbc --output-on-failure
 ```
 
 依赖：系统 `python3` + `mujoco`（3.x）、`g++`（C++17）、仓库内 Eigen。`BUILD_MPC_WBC_TESTS` 默认关闭，不影响 ONNX 仿真/真机构建。
+
+### 运行 S4 位置环跑步（MuJoCo，无头）
+
+```bash
+cmake -S . -B build -DBUILD_MPC_WBC_SIM=ON
+cmake --build build -j
+mpc_wbc/test/run_s4_position_loop.sh 24     # 启动无头仿真 + 控制器 + 自动分析
+```
+
+脚本默认关闭 viewer（`MUJOCO_VIEWER=0`）；手动可视化时先 `python3 interface/robot/simulation/mujoco_simulation.py`，再运行 `build/mpc_wbc/mpc_wbc_position_loop_sim`。
 
 ### S1 对表结果（500 个随机位姿，覆盖真实关节范围）
 
@@ -72,6 +89,28 @@ cd build && ctest -R mpc_wbc --output-on-failure
 | `M` 不对称度 | `0` | `< 1e-9` |
 | `M` 最小特征值 | `1.27e-3` | `> 0` |
 
+### S3 自检结果
+
+| 检查 | 结果 |
+| --- | --- |
+| 零命令停步（四足静立、足位 = 名义足位） | ✅ |
+| 起步/停步滞回 | ✅ |
+| 六种单轴 + 混合命令下足目标可达（IK 成功、无越限） | ✅ |
+| 足端位置全程连续（每步 < `1.13e-4`，最大足速约 1.3 m/s） | ✅ |
+| 支撑相机体系速度 = `-(v + ω×p0)`（误差 `7.4e-12`） | ✅ |
+| 未来支撑表与逐点接触判据一致 | ✅ |
+
+### S4 位置环跑步结果（无头 MuJoCo，24 s）
+
+| 阶段 | Δx (m) | Δy (m) | Δyaw | max tilt | min base z |
+| --- | --- | --- | --- | --- | --- |
+| walk_fwd | `+0.186` | `0.005` | `2.2°` | `1.0°` | `0.331` |
+| walk_back | `-0.340` | `-0.013` | `-0.7°` | `2.0°` | `0.332` |
+| walk_left | `-0.137` | `+0.252` | `3.6°` | `1.5°` | `0.332` |
+| turn | `-0.127` | `-0.047` | `+34.1°` | `1.2°` | `0.332` |
+
+站立之后机身最大倾斜 `3.2°`、最低机身高 `0.331 m`，全程未跌倒，程序干净退出。位置环为开环、无姿态/力反馈，故侧移段存在少量前向漂移；这正是 S5–S7 要解决的问题。
+
 ### 已知待办 / 边界
 
 - `IK` 的 HipX 侧摆有两个分支（都精确到达同一目标）。控制中应传上一帧关节角作为 `q_seed`，取最近解以保证连续性。
@@ -80,4 +119,7 @@ cd build && ctest -R mpc_wbc --output-on-failure
 - `BiasForce()` 的重力作为参数传入。MuJoCo 默认 `(0,0,-9.81)`，而 `support/types/common_types.h` 里 `gravity=9.815`；接入控制器时必须统一。
 - `ContactJacobianWorld()` 用球足最低点（世界系 `-z` 偏移 `foot_radius`）作为接触点，仅对平地法向成立；WBC 需要 `Jdot·v` 项在 S7 补。
 - 动力学目前用「各刚体惯性广义力求和」（与 RNEA 等价）实现；若需更快的在线计算，S7 再评估 CRBA/RNEA 优化。
+- 步态支撑相用机体系线性后扫（开环）；世界系足端锚点锁定需要基座位置/速度估计，留到 S5 之后。
+- 停步为「立即回到名义足位」，未做收步过渡（S9/S10 平滑）。
+- 摆动起落点与支撑相速度在切换瞬间不连续（五次曲线端点速度为 0，支撑相为 `-v`）；位置连续，速度跳变属已知简化。
 

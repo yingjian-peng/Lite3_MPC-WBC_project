@@ -11,11 +11,20 @@ target_include_directories(mpc_wbc INTERFACE
   ${WORKSPACE_DIR}/support/utils
 )
 
+# S4 位置环跑步基线（通过 UDP 与 mujoco_simulation.py 通信）
+if(BUILD_MPC_WBC_SIM)
+  add_executable(mpc_wbc_position_loop_sim apps/position_loop_sim.cpp)
+  target_link_libraries(mpc_wbc_position_loop_sim mpc_wbc interface pthread)
+endif()
+
 if(BUILD_MPC_WBC_TESTS)
   add_executable(lite3_kinematics_test test/lite3_kinematics_test.cpp)
   target_link_libraries(lite3_kinematics_test PRIVATE mpc_wbc)
   add_executable(lite3_dynamics_test test/lite3_dynamics_test.cpp)
   target_link_libraries(lite3_dynamics_test PRIVATE mpc_wbc)
+  add_executable(lite3_gait_trajectory_test test/lite3_gait_trajectory_test.cpp)
+  target_link_libraries(lite3_gait_trajectory_test PRIVATE mpc_wbc)
+  add_test(NAME mpc_wbc_gait_trajectory COMMAND lite3_gait_trajectory_test)
 
   find_program(PYTHON3_EXECUTABLE python3)
   if(PYTHON3_EXECUTABLE)

@@ -17,6 +17,7 @@ option(BUILD_SIM "Build the MuJoCo UDP simulation controller" OFF)
 option(SEND_REMOTE "Copy the built controller to Lite3" OFF)
 option(USE_MOLD_LINKER "Use mold for faster linking" OFF)
 option(BUILD_MPC_WBC_TESTS "Build MPC/WBC table-check tests" OFF)
+option(BUILD_MPC_WBC_SIM "Build the MPC/WBC position-loop MuJoCo app" OFF)
 
 if(BUILD_PLATFORM STREQUAL "arm" OR SEND_REMOTE)
   set(BUILD_SIM OFF)

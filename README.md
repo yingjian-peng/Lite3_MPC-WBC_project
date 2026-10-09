@@ -69,12 +69,20 @@ cmake --build build -j
 
 ### MPC+WBC 开发对表（可选）
 
-MPC+WBC 算法位于 `mpc_wbc/`，当前已完成运动学（FK/IK/雅可比）与全身动力学（`M/h/Jc`）。开启对表测试后可用 CTest 跑 MuJoCo 数值对照（需要 `python3` 与 `mujoco`）：
+MPC+WBC 算法位于 `mpc_wbc/`，当前已完成运动学（FK/IK/雅可比）、全身动力学（`M/h/Jc`）与 trot 步态/足端轨迹，并跑通位置环基线（S4）。开启对表测试后可用 CTest 跑 MuJoCo 数值对照（需要 `python3` 与 `mujoco`）：
 
 ```bash
 cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON
 cmake --build build -j
 cd build && ctest -R mpc_wbc --output-on-failure
+```
+
+位置环跑步基线（无头仿真 + 自动分析）：
+
+```bash
+cmake -S . -B build -DBUILD_MPC_WBC_SIM=ON
+cmake --build build -j
+mpc_wbc/test/run_s4_position_loop.sh 24
 ```
 
 `BUILD_MPC_WBC_TESTS` 默认关闭，不影响上面的 ONNX 仿真/真机构建。详见 [mpc_wbc/README.md](mpc_wbc/README.md) 与 [MPC+WBC 实现步骤与里程碑](docs/04_Lite3_MPC_WBC实现步骤与里程碑.md)。

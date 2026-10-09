@@ -53,6 +53,10 @@ struct Lite3Geometry {
     double hip_lateral = 0.09735;     // FL_HIP -> FL_THIGH 的 |y| 偏移（髋侧向偏置）
     double foot_radius = 0.022;       // FL_FOOT 球足半径
 
+    // 关节限位（MJCF range，弧度），每腿相同，顺序 HipX, HipY, Knee
+    Vec3d joint_lower = Vec3d(-0.523, -2.67, 0.524);
+    Vec3d joint_upper = Vec3d(0.523, 0.314, 2.792);
+
     // 髋关节安装点在机体系下的位置，MJCF 顺序 FL, FR, HL, HR
     std::array<Vec3d, kNumLegs> hip_pos_body = {{
         Vec3d(0.1745, 0.062, 0.0),    // FL
