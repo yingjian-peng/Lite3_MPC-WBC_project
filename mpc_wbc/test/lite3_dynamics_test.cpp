@@ -56,13 +56,13 @@ int main(int argc, char** argv) {
 
     Lite3Model model;
 
-    ErrorStats m_err, h_err, jc_err;
+    ErrorStats m_err, h_err, jc_err, com_err, inertia_err;
     double max_mass_block_err = 0.0;
     double max_asym = 0.0;
     double min_eig = 1e300;
 
     for (int c = 0; c < n; ++c) {
-        Vec3d base_pos, gravity;
+        Vec3d base_pos, gravity, com_ref;
         Vec4d quat;
         Vec12d q;
         Vec18d qvel;
@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 12; ++i) in >> q(i);
         for (int i = 0; i < 18; ++i) in >> qvel(i);
         for (int i = 0; i < 3; ++i) in >> gravity(i);
+        for (int i = 0; i < 3; ++i) in >> com_ref(i);
 
         Mat18d M_ref;
         for (int i = 0; i < 18; ++i)
@@ -89,6 +90,11 @@ int main(int argc, char** argv) {
         h_err.Add(h, bias_ref);
         jc_err.Add(model.ContactJacobianWorld(q, R_B), Jc_ref);
 
+        // S6 用到的整机质心与合成惯量：分别对 MuJoCo 的 subtree_com 与 M(q) 的
+        // 浮动基旋转块（= 绕浮动基原点的合成惯量，机体系表达）。
+        com_err.Add(model.CompositeComWorld(q, R_B, base_pos), com_ref);
+        inertia_err.Add(model.CompositeInertiaBody(q, Vec3d::Zero()), M_ref.block<3, 3>(3, 3));
+
         // 结构检查：左上 3x3 应等于总质量 × I；M 对称；正定。
         const double mt = model.TotalMass();
         max_mass_block_err = std::max(
@@ -103,6 +109,8 @@ int main(int argc, char** argv) {
     ok &= Check("Mass matrix M(q)", m_err, 1e-9);
     ok &= Check("Bias force h(q,qvel)", h_err, 1e-9);
     ok &= Check("Contact Jacobian Jc", jc_err, 1e-9);
+    ok &= Check("整机质心 (subtree_com)", com_err, 1e-9);
+    ok &= Check("整机合成惯量绕基座原点", inertia_err, 1e-9);
     std::printf("  %-32s max_abs=%.3e  (expect ~0)\n", "M base 3x3 vs m_total*I", max_mass_block_err);
     std::printf("  %-32s max_abs=%.3e  (expect ~0)\n", "M asymmetry", max_asym);
     std::printf("  %-32s min_eig=%.3e  (expect >0)\n", "M smallest eigenvalue", min_eig);

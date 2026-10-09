@@ -4,17 +4,21 @@
 用法：
     python3 mpc_wbc/test/gen_mujoco_dynamics_cases.py <out_file> [num_cases]
 
-每个 case 35 行：
+每个 case 36 行：
     px py pz qw qx qy qz          # 浮动基位置 + 四元数(wxyz)
     q0 ... q11                    # 12 个关节角
     qv0 ... qv17                  # 广义速度 [v_world(3); omega_body(3); dq(12)]
     gx gy gz                      # MuJoCo 重力向量
+    com_x com_y com_z             # 整机质心（世界系，data.subtree_com[0]）
     18 行：M(q)（每行 18 个数）
     1 行：qfrc_bias（18 个数）= C·qvel + G
     12 行：接触点雅可比 Jc（世界系，4 足 × 3 行）
 
 Jc 由 mj_jacBody(FOOT) 换算：球足最低点相对球心在世界系下偏移 d=(0,0,-r)，
     Jc = jacp - skew(d) · jacr
+
+M(q) 的浮动基旋转块 M[3:6, 3:6]（机体系表达）= 整机绕浮动基原点的合成惯量，
+可用于校验 CompositeInertiaBody()（S6 用到的 SRBD 惯量）。
 """
 import sys
 import numpy as np
@@ -100,6 +104,7 @@ def main():
         lines.append(" ".join(f"{v:.17g}" for v in q))
         lines.append(" ".join(f"{v:.17g}" for v in qvel))
         lines.append(" ".join(f"{v:.17g}" for v in m.opt.gravity))
+        lines.append(" ".join(f"{v:.17g}" for v in d.subtree_com[0]))  # 整机质心（世界系）
         for r in range(m.nv):
             lines.append(" ".join(f"{v:.17g}" for v in M[r]))
         lines.append(" ".join(f"{v:.17g}" for v in d.qfrc_bias))

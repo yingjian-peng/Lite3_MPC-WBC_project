@@ -43,6 +43,8 @@ using Mat18d = Eigen::Matrix<double, kNumGenVel, kNumGenVel>;
 using Mat3x18d = Eigen::Matrix<double, 3, kNumGenVel>;
 using Mat12x18d = Eigen::Matrix<double, kNumContactForces, kNumGenVel>;
 using Mat3x12d = Eigen::Matrix<double, 3, kNumJoints>;
+using VecContact12d = Eigen::Matrix<double, kNumContactForces, 1>;  // 四脚×3
+using VecNv = Vec18d;
 
 // ---------------------------------------------------------------------------
 // 几何参数（MJCF 实测值）
@@ -144,7 +146,8 @@ inline Mat3d AxisAngle(const Vec3d& axis, double angle) {
 /// 在机体系角速度 omega_body 下把旋转向前积分 dt：R <- R * Exp([omega_body] dt)。
 inline Mat3d IntegrateBodyRotation(const Mat3d& R, const Vec3d& omega_body, double dt) {
     const double n = omega_body.norm();
-    if (n * dt < 1e-12) return R;
+    // 注意用 fabs：写成 n*dt < 1e-12 时，负 dt（向后积分）会恒为真而直接返回 R。
+    if (std::fabs(n * dt) < 1e-12) return R;
     return R * AxisAngle(omega_body / n, n * dt);
 }
 
@@ -379,6 +382,67 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // 接触点偏置加速度 Jdot_c·qvel（S7 WBC 的支撑无滑约束需要）。
+    //   a_contact = Jc(q)·qdd + Jdot_c(q,qvel)·qvel
+    // docs/04 S7 明确要求「不得省略 Jdot·v」，否则支撑脚在加速时会被判成“应该是零加速度”。
+    // Jdot_c·qvel 用中心差分算：把广义位置沿 qvel 用指数映射前后各推 ε，取
+    //   Jdot·qvel ≈ (Jc(q⊕ε·qvel) − Jc(q⊖ε·qvel))·qvel / (2ε)
+    // 注意：Jc 只依赖关节角与基座姿态（与基座位置无关），故只推 R_B 与 q。
+    // -----------------------------------------------------------------------
+    VecContact12d ContactBiasAccel(const Vec12d& q, const Mat3d& R_B,
+                                   const Vec18d& qvel, double eps = 1e-6) const {
+        const Vec3d omega_body = qvel.segment<3>(3);
+        const Vec12d dq = qvel.segment<kNumJoints>(6);
+        const Mat3d R_p = IntegrateBodyRotation(R_B, omega_body, +eps);
+        const Mat3d R_m = IntegrateBodyRotation(R_B, omega_body, -eps);
+        const Mat12x18d J_p = ContactJacobianWorld(q + eps * dq, R_p);
+        const Mat12x18d J_m = ContactJacobianWorld(q - eps * dq, R_m);
+        return ((J_p - J_m) / (2.0 * eps)) * qvel;
+    }
+
+    // -----------------------------------------------------------------------
+    // 整机质心与合成惯量（S6 SRBD-MPC 用）。点坐标均在机体系下、以浮动基原点为参考。
+    // -----------------------------------------------------------------------
+    /// 整机质心在机体系下的位置（相对浮动基原点）。
+    Vec3d CompositeComBody(const Vec12d& q) const {
+        std::array<Mat3d, kNumBodies> R;
+        std::array<Vec3d, kNumBodies> p;
+        ComputeBodyPoses(q, &R, &p);
+        Vec3d num = Vec3d::Zero();
+        double m = 0.0;
+        for (int i = 0; i < kNumBodies; ++i) {
+            num += bodies[i].mass * (p[i] + R[i] * bodies[i].com);
+            m += bodies[i].mass;
+        }
+        return num / m;
+    }
+
+    /// 整机质心在世界系下的位置（p_base_w 为浮动基原点在世界系下的位置）。
+    Vec3d CompositeComWorld(const Vec12d& q, const Mat3d& R_B, const Vec3d& p_base_w) const {
+        return p_base_w + R_B * CompositeComBody(q);
+    }
+
+    /// 整机绕机体系点 point_body 的合成惯量（表达在机体系）。平行轴定理逐刚体累加。
+    Mat3d CompositeInertiaBody(const Vec12d& q, const Vec3d& point_body) const {
+        std::array<Mat3d, kNumBodies> R;
+        std::array<Vec3d, kNumBodies> p;
+        ComputeBodyPoses(q, &R, &p);
+        Mat3d I = Mat3d::Zero();
+        for (int i = 0; i < kNumBodies; ++i) {
+            const BodyParams& b = bodies[i];
+            const Vec3d d = (p[i] + R[i] * b.com) - point_body;
+            I += R[i] * b.inertia_diag.asDiagonal() * R[i].transpose() +
+                 b.mass * (d.squaredNorm() * Mat3d::Identity() - d * d.transpose());
+        }
+        return I;
+    }
+
+    /// 整机绕机体系点 point_body 的合成惯量，旋转到世界系表达。
+    Mat3d CompositeInertiaWorld(const Vec12d& q, const Mat3d& R_B, const Vec3d& point_body) const {
+        return R_B * CompositeInertiaBody(q, point_body) * R_B.transpose();
+    }
+
+    // -----------------------------------------------------------------------
     // 默认站立关节角（docs/03 附录 C：每腿 [0, -0.65, 1.3]）
     // -----------------------------------------------------------------------
     static Vec3d DefaultStandLegAngles() { return Vec3d(0.0, -0.65, 1.3); }
@@ -454,6 +518,23 @@ private:
             b.com = Vec3d::Zero();
             b.inertia_diag = Vec3d::Zero();
             bodies[FootBodyIndex(leg)] = b;
+        }
+    }
+
+    /// 计算各刚体相对浮动基原点的位姿：R 用机体系表达（R_B 取单位阵），p 为机体系位置。
+    void ComputeBodyPoses(const Vec12d& q, std::array<Mat3d, kNumBodies>* R,
+                          std::array<Vec3d, kNumBodies>* p) const {
+        for (int i = 0; i < kNumBodies; ++i) {
+            const BodyParams& b = bodies[i];
+            if (b.parent < 0) {
+                (*R)[i] = Mat3d::Identity();
+                (*p)[i] = Vec3d::Zero();
+            } else {
+                const int par = b.parent;
+                const double angle = (b.joint_col >= 0) ? q(b.joint_col) : 0.0;
+                (*R)[i] = (*R)[par] * AxisAngle(b.axis, angle);
+                (*p)[i] = (*p)[par] + (*R)[par] * b.offset;
+            }
         }
     }
 
