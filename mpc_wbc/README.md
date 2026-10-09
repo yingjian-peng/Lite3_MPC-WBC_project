@@ -16,6 +16,7 @@
 | S5 | 状态估计（基座速度/高度/触地可信度） | ✅ 通过 |
 | S6 | SRBD 预测时域 MPC（逐脚力 + 期望 wrench） | ✅ 通过 |
 | S7 | Weighted-QP WBC（自研 QP + MuJoCo 复核） | ✅ 通过 |
+| S8 | 控制器编排 + 状态机线程 | ✅ 编排/线程/安全退化/站立通过；trot 行走稳定性移交 S9（见 [docs/04 §8](../docs/04_Lite3_MPC_WBC实现步骤与里程碑.md)） |
 
 ## 文件
 
@@ -28,7 +29,10 @@
 | `box_qp.hpp` | 盒约束 QP（无约束解 → 主动集投影牛顿 → 坐标下降兜底），供 SRBD-MPC 求解接触力分配。 |
 | `qp_ipm.hpp` | S7 自研稠密 QP（原-对偶内点 + Mehrotra 预测-校正）：`min ½xᵀHx+gᵀx s.t. A_eq x=b_eq, A_ge x≥b_ge`，零第三方依赖；返回 `x/y/z`（乘子）便于做 KKT 自检。 |
 | `04_weighted_wbc.hpp` | S7 统一 Weighted-QP WBC：决策 `[q̈(18); f(12); τ(12)]`，硬约束 = EoM + 支撑无滑（含 `Jdot·v`）+ 摆动 `f=0` + 摩擦金字塔 + 法向力上限 + 力矩上下界；软任务 = 基座 6D + 摆动足 PD（+ 可选力参考/站姿/力矩正则）。`BuildQp` 可独立取出组装好的 QP 做最优性复核。 |
+| `05_mpc_wbc_controller.hpp` | S8 控制器编排：估计 → 步态 → MPC 请求快照 → WBC → 12×5 命令（无线程、无 IO、不继承 `StateBase`）；`SeqLockBox<T>` 无锁快照 + `MpcWorkerThread`（MPC 独立线程）；命令低通 + 变化率限幅、WBC 使能滞回、质心高度软启动、`wrench_max_age` 过期降级、故障位。 |
+| `apps/mpc_wbc_sim.cpp` | S8 离线整机 harness：复刻 `StandUpState` 两阶段起立 + 条件交棒，走 UDP 与 MuJoCo 通信，输出相位表与 32 列诊断 CSV；`S8_PHASES=stand|walk`、`S8_PD_SCALE/S8_W_SWING/S8_MPC_PERIOD/S8_HYST/S8_CMD_SCALE` 可调参。 |
 | `apps/position_loop_sim.cpp` | S4 位置环跑步程序：站立斜坡 + 步态/IK + 关节 PD，通过 UDP 与仿真通信。 |
+| `../state_machine/mpc_control_state.hpp` | S8 状态机：1 kHz `Run()` 唯一 `SetJointCommand()` 写入权 + MPC 工作线程；`LoseControlJudge`（姿态/故障）与 `GetNextStateName`（→ `kLieDown`/`kRLControl`）。 |
 | `CMakeLists.txt` | `mpc_wbc` INTERFACE 库、对表/自检 target（`BUILD_MPC_WBC_TESTS`）与仿真程序（`BUILD_MPC_WBC_SIM`）。 |
 | `test/gen_mujoco_cases.py` | 运动学真值：随机位姿 + `mj_forward` / `mj_jacBody`。 |
 | `test/lite3_kinematics_test.cpp` | 比较 FK / 雅可比 / IK 回代。 |
@@ -42,6 +46,8 @@
 | `test/lite3_wbc_test.cpp` | S7 WBC 离线自检：`Jdot·v` 对表、静立承重、基座 6D 跟踪、摆动任务、KKT 最优性证书、权重单调性、极限工况、MPC 串联、耗时、失败兜底、PD 反解，并导出 MuJoCo 复核用例。 |
 | `test/gen_mujoco_contact_accel_cases.py` | S7 真值：用 `mj_integratePos` + 中心差分生成接触点加速度 `Jc·q̈ + Jdot·q̇` 的 MuJoCo oracle。 |
 | `test/check_wbc_hover_mujoco.py` | S7 独立复核：把 WBC 解（`q/qvel/qdd/f/τ/stance`）回灌 MuJoCo（`ctrl=τ` + `mj_applyFT` 施加逐脚接触力），验证 `qacc≈qdd`、支撑无滑、摆动 `f=0`。 |
+| `test/lite3_controller_test.cpp` | S8 离线自检（8 段，不需要 MuJoCo）：起立退让（`τ_ff≡0`）、使能滞回、安全退化、MPC 过期降级、命令平滑、MPC 抖动不阻塞 1 kHz 路径、`τ_ff` 反解、连续失败兜底。 |
+| `test/run_s8_mpc_wbc.sh` | S8 验收：离线自检（默认）+ 可选整机 harness（`stand` / `walk`）。 |
 | `test/run_s4_position_loop.sh` + `analyze_s4_log.py` | S4 验收：无头仿真 + 位置环程序 + 日志分析。 |
 | `test/run_*_test.sh` | 一键编译 + 运行各自测试/验证（独立于 CMake）。 |
 
@@ -64,6 +70,7 @@ mpc_wbc/test/run_gait_trajectory_test.sh
 mpc_wbc/test/run_state_estimator_test.sh 10
 mpc_wbc/test/run_srbd_mpc_test.sh
 mpc_wbc/test/run_wbc_test.sh
+mpc_wbc/test/run_s8_mpc_wbc.sh
 ```
 
 方式二（纳入 CMake 构建，由 CTest 管理）：
@@ -85,6 +92,24 @@ mpc_wbc/test/run_s4_position_loop.sh 24     # 启动无头仿真 + 控制器 + �
 ```
 
 脚本默认关闭 viewer（`MUJOCO_VIEWER=0`）；手动可视化时先 `python3 interface/robot/simulation/mujoco_simulation.py`，再运行 `build/mpc_wbc/mpc_wbc_position_loop_sim`。
+
+### 运行 S8 整机 MPC+WBC（MuJoCo，无头）
+
+```bash
+mpc_wbc/test/run_s8_mpc_wbc.sh            # 只跑离线确定性自检
+mpc_wbc/test/run_s8_mpc_wbc.sh stand      # + 站立保持 20 s（整机闭环）
+mpc_wbc/test/run_s8_mpc_wbc.sh walk       # + 全序列（前后/侧移/转向）
+```
+
+也可以直接起仿真再跑 harness（可视化加 `MUJOCO_VIEWER=1`）：
+
+```bash
+MUJOCO_VIEWER=0 SIM_DURATION=26 python3 interface/robot/simulation/mujoco_simulation.py &
+S8_PHASES=stand ./build/mpc_wbc/mpc_wbc_mpc_wbc_sim build/s8_phases.csv build/s8_diag.csv
+python3 mpc_wbc/test/analyze_s4_log.py build/s8_sim.csv build/s8_phases.csv
+```
+
+`mpc_wbc_sim` 的环境变量：`S8_PHASES=stand|walk`、`S8_PD_SCALE`、`S8_W_SWING`、`S8_MPC_PERIOD`、`S8_HYST`、`S8_CMD_SCALE`；诊断 CSV 列含义见 `apps/mpc_wbc_sim.cpp` 的表头（`step_ms/mpc_ms/wbc_iters/eom_res/cone_viol/a_des/alpha_des/num_support/wrench_age` 等）。**harness 交棒是条件式**（关节误差 < 0.15 rad、tilt < 0.2 rad；超 1.5 s 宽限则报「起立未收敛」退出），避免在半蹲状态把控制权交给 MPC 而误判成"控制律不稳"。
 
 ### S1 对表结果（500 个随机位姿，覆盖真实关节范围）
 
@@ -185,6 +210,29 @@ mpc_wbc/test/run_s4_position_loop.sh 24     # 启动无头仿真 + 控制器 + �
 
 **软任务的边界（重要，别再踩）**：软任务只承诺「加权最优」，不承诺「都精确」。`w_posture`（站姿）/`w_f_ref`（力参考）/`w_tau`（力矩正则）三项默认 **0**，因为它们与主任务抢同一组关节或同一组接触力——实测 `w_posture=1` 会让摆动任务残差与基座误差**同时**从 `0.033/0.193` 恶化到 `3.92/0.745`；`w_tau=1e-3` 会把无竞争时的基座任务从 `q̈_x=0.5000` 拉到 `0.4999869`。参考工程 `09_weighted_wbc` 的任务集只有「基座 6D + 摆动足」，力参考任务在 docs/03 §11.3 里被整条删除。`Σfz = m·g` 也只在**没有摆动腿**时严格成立（`qvel≠0` 有科氏偏置、腿部加速度经 `M` 非对角块耦合进基座 z 行），一般情形用 `Σfz = (M q̈ + h)_z`。
 
+### S8 控制器编排自检结果（离线确定性 + MuJoCo 整机 harness）
+
+`mpc_wbc/test/run_s8_mpc_wbc.sh`（离线 8 段，0 failures）：起立退让、使能滞回、安全退化、MPC 过期降级、命令平滑、1 kHz 路径不阻塞、`τ_ff` 反解、连续失败兜底。同一套控制器再跑 MuJoCo 闭环（`run_s8_mpc_wbc.sh stand|walk`）：
+
+| 检查 | 结果 |
+| --- | --- |
+| 离线自检 8 段 | 8/8 PASS，0 failures |
+| 起立退让 | `τ_ff ≡ 0`（同时 `|PD|max = 30 N·m`，证明位置环确实在出力） |
+| 使能滞回 | 门关闭后仍保持 WBC 40 帧，之后退回位置环（`τ_ff` 归零） |
+| 命令平滑 | 阶跃 0.2 m/s，0.2 s 后 0.1103（理论 0.1101），稳态 0.2000 |
+| MPC 抖动不阻塞 | MPC 线程塞 20 ms 睡眠，1000 帧内 1 kHz 路径 p50 `0.533` / max `3.241 ms` |
+| `τ_ff` 反解 | `|τ_applied − τ_wbc|max = 2.5e-6 N·m`（float 量化内） |
+| 站立 20 s ×4（MuJoCo 闭环） | 全 PASS，max tilt `0.6/0.7/0.6/0.6°`，min bz `0.340 m` |
+| 站立 1 kHz 单帧耗时 | mean `0.501–0.509` / p99 `0.58–0.74` / max `4.6–15.3 ms`；超 1 ms 帧 `0.17–0.21%`（OS 抢占） |
+| 站立 MPC 线程 | mean `2.67–2.76` / max `3.05 ms`；`wrench_age` mean `29.6` / max `57 ms`（阈值 150） |
+| 站立硬约束残差 | EoM `≤2.8e-14`、接触 `≤3.4e-16`、锥违反 `0` |
+| 站立力矩 / 承重 | `|τ|max 4.5 N·m`（限 30）、`Σfz` mean `117 N`（`mg = 117.1 N`）、WBC 激活 `99.8%` |
+| 状态机路径（`LITE3_CONTROL_PATH=mpc_wbc`） | `idle → standup → mpc_wbc_control`；站立 6 s（bz 0.349、tilt≈0）；前进 1.4 m（pitch<2°）；超限自动 `joint_damping → idle` |
+| 交棒质量 | 关节误差 `0.017–0.018 rad`、tilt `0.2°`；接管 0.2 s 后估计高度 `0.3402–0.3405 m`、置信度 `1.00`、支撑腿 4 |
+| **trot 行走（4 次）** | **全部失败**：`walk_fwd` 前进 `0.49–0.77 m` 后在 1.8–2.6 s 发散，或 `stop1`（命令回零）0.54 s 后发散 → 移交 S9（见下） |
+
+---
+
 ### 已知待办 / 边界
 
 - `IK` 的 HipX 侧摆有两个分支（都精确到达同一目标）。控制中应传上一帧关节角作为 `q_seed`，取最近解以保证连续性。
@@ -207,4 +255,11 @@ mpc_wbc/test/run_s4_position_loop.sh 24     # 启动无头仿真 + 控制器 + �
 - S7 的 `w_base=1e3 / w_swing=1e2` 沿用参考工程整定值，本工程尚未闭环整定（S9/S10）。
 - MuJoCo ≥3.0 的 `data.xfrc_applied` **不被 `mj_forward` 消费**（只在 `mj_step` 生效）；离线正动力学复核要用 `mj_applyFT` 累加进 `data.qfrc_applied`。球足踩平地的接触点 = 球心 + **世界系** `(0,0,−r_foot)`，不是机体系 `-z` 乘 `R_foot`。
 - `λ` 正则化必须远小于跟踪权重：取 `1e-3` 时会为了压小 `λ` 而把承重拉偏 `0.25%`（预测高度漂移 4 mm），已改用 `1e-6`。
+- **S8 的 `τ_ff` 语义**：低层执行律是 `τ_applied = kp(q_des−q) + kd(dq_des−dq) + τ_ff`，所以 WBC 生效时 `τ_ff = τ_wbc − PD`；**WBC 未使能时必须 `τ_ff = 0`**（否则等于把 PD 反向叠加一次，再被 `±30` 夹住 → 凭空多出 `−30 N·m`，起立会被顶翻）。
+- **S8 的命令平滑顺序**：必须「先一阶低通（`cmd_tau=0.25 s`）后变化率限幅（`0.8 m/s²`、`2.0 rad/s²`）」；反序等于两个滞后串联，命令几乎不动。`dt ≤ 0` 的帧不推进平滑器。
+- **S8 的高度命令软启动**：`com_height_slew=0.06 m/s`，从实测质心高度爬到 `stand_com_height`；直接给目标会在 engage 瞬间要 ~30 m/s² 竖直加速度（τ 顶到 28.7 N·m，偶发顶翻）。
+- **S8 的 WBC 使能滞回**：`wbc_enable_hold_frames=40`（1 kHz 下 40 ms），门关闭（估计失效/支撑不足/姿态偏大）时保持，只有超 `tilt_limit=0.8 rad` 判故障才立即失效——一帧一帧开关会同时改 PD 增益（×2）与 `τ_ff`，比撑着跑更糟。
+- **S8 未通过项（移交 S9 第一项）**：trot 行走 4/4 失败——`walk_fwd` 前进 `0.49–0.77 m` 后 1.8–2.6 s 发散（tilt 46–155°），或 `stop1`（命令回零）0.54 s 后发散；失稳期实测 MPC 迭代 `0 → 75/2100`、残差 `1e-14 → 6e-5`、`Σfz` 峰值 `224 N`（≈1.9 mg）、`|τ_ff|` 打到 30 N·m 限幅、估计 `num_support` 掉到 1。参考工程 docs/03 §12.4/§12.5 记录过同类未解决问题。
+- **S8 的接管条件不对称**：harness 已改成条件交棒（关节误差 < 0.15 rad、tilt < 0.2 rad，超 1.5 s 宽限报错退出），但真机状态机路径仍是**按时间**交棒（`standup_state.hpp` 的 `2*stand_duration_`），S9 应统一。
+- 1 kHz 路径 p99 `≤0.74 ms`，但仍有 `0.17–0.21%` 帧超 1 ms（max 4.6–15.3 ms，OS 抢占，非算法）；真机需 RT 优先级或提频。
 

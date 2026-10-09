@@ -15,6 +15,9 @@ target_include_directories(mpc_wbc INTERFACE
 if(BUILD_MPC_WBC_SIM)
   add_executable(mpc_wbc_position_loop_sim apps/position_loop_sim.cpp)
   target_link_libraries(mpc_wbc_position_loop_sim mpc_wbc interface pthread)
+  # S8：整机 MPC+WBC 离线 harness（同一套 MpcWbcController，走 UDP 与 MuJoCo 通信）
+  add_executable(mpc_wbc_mpc_wbc_sim apps/mpc_wbc_sim.cpp)
+  target_link_libraries(mpc_wbc_mpc_wbc_sim mpc_wbc interface pthread)
 endif()
 
 if(BUILD_MPC_WBC_TESTS)
@@ -32,11 +35,18 @@ if(BUILD_MPC_WBC_TESTS)
   target_link_libraries(qp_ipm_test PRIVATE mpc_wbc)
   add_executable(lite3_wbc_test test/lite3_wbc_test.cpp)
   target_link_libraries(lite3_wbc_test PRIVATE mpc_wbc)
+  # S8：控制器编排离线自检（含 MPC 工作线程，需要 pthread）
+  add_executable(lite3_controller_test test/lite3_controller_test.cpp)
+  target_link_libraries(lite3_controller_test PRIVATE mpc_wbc pthread)
   add_test(NAME mpc_wbc_gait_trajectory COMMAND lite3_gait_trajectory_test)
   # S6 SRBD-MPC 离线自检：不需要 MuJoCo，纯数值/物理检查
   add_test(NAME mpc_wbc_srbd_mpc COMMAND lite3_srbd_mpc_test)
   # S7：自研 QP 求解器单测 + Weighted-QP WBC 离线自检（不需要 MuJoCo）
   add_test(NAME mpc_wbc_qp_ipm COMMAND qp_ipm_test)
+  # S8：控制器编排离线自检（起立退让/使能滞回/安全退化/MPC 降级/命令平滑/1 kHz 路径不阻塞）。
+  # 整机 MuJoCo 闭环 harness 需要仿真进程 + 真实墙钟，放在 mpc_wbc/test/run_s8_mpc_wbc.sh
+  # 的 stand|walk 模式下，不注册进 CTest 以保持测试集确定性。
+  add_test(NAME mpc_wbc_controller COMMAND lite3_controller_test)
 
   find_program(PYTHON3_EXECUTABLE python3)
   if(PYTHON3_EXECUTABLE)

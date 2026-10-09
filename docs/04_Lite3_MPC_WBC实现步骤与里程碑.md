@@ -191,16 +191,18 @@ flowchart TD
 #### S8 控制器编排 + 状态机线程（对应 P6）
 - **目标**：把估计/步态/MPC/WBC 编排成无线程算法对象，并在状态机里加并列的 MPC 状态。
 - **交付**：
-  - `mpc_wbc/05_mpc_wbc_controller.hpp`：无 `StateBase` 继承、无线程、不直接调 `RobotInterface`；封装参数、IK 到 12×5 命令及故障状态。
+  - `mpc_wbc/05_mpc_wbc_controller.hpp`：无 `StateBase` 继承、无线程、不直接调 `RobotInterface`；封装参数、IK 到 12×5 命令及故障状态；另含 `SeqLockBox` 快照与 `MpcWorkerThread`（供上层选配）。
   - `state_machine/mpc_control_state.hpp`：继承 `StateBase`，实现 `OnEnter/Run/LoseControlJudge/GetNextStateName/OnExit`，持有独立工作线程、完整快照、唯一 `SetJointCommand()` 写入权。
   - `state_machine/state_machine.hpp`：启动配置选择 `onnx` 或 `mpc_wbc`，把现有 `kRLControl` 路由指向选中状态（首版保留数值 6 与按键含义）。
-- **线程契约**：状态估计/步态/WBC/命令发布目标 `500–1000 Hz`；MPC 每 `20–50 ms` 解一次；`MPCControlState::Run()` 发布**同一时间戳**快照，工作线程只处理新序号，拒绝重复/回退/过旧时间戳。
-- **通过条件**：`onnx` 与 `mpc_wbc` 启动选项互斥（选 MPC 时不构造 ONNX）；站起/趴下/阻尼与键盘/手柄仍可用；进入/退出时**无双写、无陈旧命令**（切换先 `join` 原线程再交出写入权）。
+- **线程契约**：状态估计/步态/WBC/命令发布目标 `500–1000 Hz`；MPC 每 `20–50 ms` 解一次；`MPCControlState::Run()` 发布**同一时间戳**快照，工作线程只处理新序号，拒绝重复/回退/过旧时间戳。`wrench_max_age=0.15 s`：过期即把 `a_des/α_des` 归零（原地保持），不重放旧 wrench。
+- **通过条件**：`onnx` 与 `mpc_wbc` 启动选项互斥（选 MPC 时不构造 ONNX）；站起/趴下/阻尼与键盘/手柄仍可用；进入/退出时**无双写、无陈旧命令**（切换先 `join` 原线程再交出写入权）；离线自检（起立退让 / 使能滞回 / 安全退化 / MPC 降级 / 命令平滑 / 1 kHz 路径不阻塞）全绿。
 - **风险**：现有 ONNX/接口/键盘线程共享可变数据 → 必须为两条路径都引入快照，不能只给新线程加锁。
+- **本步实际边界**：**只保证编排/线程/安全退化与站立闭环**；trot 行走稳定性不作为本步通过条件，带实测数据移交 S9 第一项（见 §8 S8）。
 
 #### S9 MuJoCo 运动验证 / A/B（对应 P7，理论 6.2）
 - **目标**：7 段自动 A/B（对照 S4 位置环基线与 ONNX），量化力控收益。
 - **交付**：测试脚本/runner（如 `state_machine/auto_test_runner.hpp` 或等价 Python 脚本）。
+- **第一项（由 S8 移交，须先做完再进入 A/B 对照）**：**trot 行走稳定性**。S8 实测包线：站立 20 s 稳定，行走 0.49–0.77 m 后失稳（`walk_fwd` 1.8–2.6 s）或在 `stop1`（命令回零）0.54 s 后失稳；失稳特征 = MPC 迭代 0 → 75/2100、残差 1e-14 → 6e-5、`Σfz` 峰值 1.9 mg、`|τ_ff|` 打到限幅、估计 `num_support` 掉到 1。候选方向（§7 待决策第 6 项）：支撑集时变（估计 `num_support` 1↔4 抖动）、落脚点/抬脚高度、MPC 退化点的数值处理、落足冲击与无滑硬约束的冲突。
 - **场景**：平地单轴六方向、混合命令、停步/换向、不同起始航向。
 - **通过条件**：不跌倒；速度符号与命令一致；无持续力矩饱和；记录轨迹、姿态、足端滑移、峰值力矩、求解时延，并与基线比较。
 - **风险**：必须用**相同起点/地面/命令序列/日志格式**对照，否则比较无意义。
@@ -268,8 +270,8 @@ flowchart TD
 | S5 | 状态估计 | S2,S4 | ✅ 通过（见 §8） |
 | S6 | SRBD preview MPC | S3,S5 | ✅ 通过（见 §8） |
 | S7 | Weighted-QP WBC | S2,S5,S6 | ✅ 通过（见 §8） |
-| S8 | 控制器编排 + 状态机线程 | S4,S6,S7 | ⬜ 未开始 |
-| S9 | MuJoCo 运动验证 / A/B | S8 | ⬜ 未开始 |
+| S8 | 控制器编排 + 状态机线程 | S4,S6,S7 | ✅ 通过（编排/线程/安全退化/站立；行走稳定性移交 S9，见 §8） |
+| S9 | MuJoCo 运动验证 / A/B | S8 | 🟨 待启动（第一项：trot 行走稳定性，已带实测数据） |
 | S10 | 工程化打磨 | S9 | ⬜ 未开始 |
 | S11 | 真机迁移 | S9,S10 | ⬜ 未开始 |
 
@@ -284,10 +286,51 @@ flowchart TD
 3. **姿态通道级别**（S6 前）：~~先做「只预测质心 p/v」的验收版，还是直接上「质心 + 姿态」完整版。~~ → **已定：直接上完整版**（状态 `[p,v,rpy,ω]`，输出逐脚力 + 净力/净力矩），见 §8 S6。
 4. **状态/按键复用**（S8 前）：是否保留 `RLControlMode=6` 数值与按键语义（首版建议保留）。
 5. **仿真力矩语义**（S7/S9 前）：记录 `data.ctrl` 与限幅后 `actuator_force`/`qfrc_actuator`，确认实际输出力矩。
+6. **trot 行走不稳的切入路线**（S9 第一项，须先定）：候选按「先排除外因、再动结构」排序 —— ① 支撑集时变：估计 `num_support` 在 1↔4 间抖动，先查是步态接触计划与测量不符、还是估计器残差阈值太松（S5 的已知缺口：`GetContactForce()` 恒零）；② 落脚点/抬脚高度（`抬脚 0.06 m`、`duty 0.68`）是否够避开落足冲击；③ MPC 退化点（`BoxQp` 2100 次迭代、残差 6e-5）如何保证「宁可不说」——失败时的降级策略已定为归零 `a_des`，但要确认归零本身是否成为激励源；④ 落足冲击 × 无滑硬约束的冲突（参考工程遗留同类问题）。
 
 ---
 
 ## 8. 步骤记录
+
+### S8 控制器编排 + 状态机线程（✅ 通过；行走稳定性已带数据移交 S9）
+
+- **交付**：
+  - [`mpc_wbc/05_mpc_wbc_controller.hpp`](../mpc_wbc/05_mpc_wbc_controller.hpp)：`MpcWbcController`（不继承 `StateBase`、不建线程、不碰 `RobotInterface`）+ `SeqLockBox<T>`（单写单读无锁快照）+ `MpcWorkerThread`（MPC 独立线程）。对外 `Reset/Step(in,wrench)/Step(in)/BuildMpcRequest/SolveWrench`。
+  - [`mpc_wbc/apps/mpc_wbc_sim.cpp`](../mpc_wbc/apps/mpc_wbc_sim.cpp)：离线整机 harness（UDP ↔ `mujoco_simulation.py`），复刻 `StandUpState` 两阶段起立，输出相位表 + 32 列诊断 CSV；`S8_PHASES=stand|walk` 等环境变量可调参。
+  - [`mpc_wbc/test/lite3_controller_test.cpp`](../mpc_wbc/test/lite3_controller_test.cpp) + [`mpc_wbc/test/run_s8_mpc_wbc.sh`](../mpc_wbc/test/run_s8_mpc_wbc.sh)：8 段离线确定性自检（不需要 MuJoCo）；CTest `mpc_wbc_controller`。
+  - [`state_machine/mpc_control_state.hpp`](../state_machine/mpc_control_state.hpp)：`MPCControlState` = 1 kHz `Run()` 唯一 `SetJointCommand()` 写入权 + MPC 工作线程 + `LoseControlJudge`/`GetNextStateName`（→ `kLieDown`/`kRLControl`）；[`state_machine.hpp`](../state_machine/state_machine.hpp) 增加 `LITE3_CONTROL_PATH=mpc_wbc` 选路，且 **onnx 与 mpc_wbc 互斥构造**。
+- **线程契约（实装）**：`Run()` 采快照 → `BuildMpcRequest()`（纯赋值，不做求解）→ 读最近一次 `MpcWrench`（seqlock）→ `Step(in, wrench)` 算 12×5 命令。MPC 线程只读请求、只写 wrench；`wrench_max_age=0.15 s`，过期即把 `a_des/α_des` 归零（原地保持，比重放旧 wrench 安全）。退出时先 `join` 工作线程再交出写入权。
+- **通过条件逐条取证**：
+  1. **启动互斥**：`LITE3_CONTROL_PATH=mpc_wbc` 时不构造 ONNX 状态（原先无条件构造 → 缺 `policy.onnx` 直接 abort）。
+  2. **离线自检 8/8 段 PASS**（`run_s8_mpc_wbc.sh`）：起立退让（τ_ff 恒 0，同时 PD 项 max 30 N·m 证明在出力）；使能滞回（关门后保持 40 帧再退回位置环）；安全退化（tilt > 0.8 → fault、故障帧不发前馈、Reset 清零）；MPC 降级（wrench 过期 → `a_des` 归零）；命令平滑（0.2 s 阶跃：0.1103 vs 理论 0.1101，稳态 0.2000）；**1 kHz 路径不被 MPC 阻塞**（MPC 线程故意塞 20 ms 睡眠，1000 帧内 p50 0.533 / max 3.241 ms）；`τ_ff` 反解（`|τ_applied − τ_wbc|max = 2.5e-6 N·m`，float 量化内）；连续失败兜底（30 帧极端输入 → 19 帧 fault）。
+  3. **站立 20 s ×4 全 PASS**：max tilt 0.6/0.7/0.6/0.6°，min bz 0.340（目标 0.3485 m）。
+  4. **状态机路径**：`idle → standup → mpc_wbc_control` 切换正常；站立 6 s（bz 0.349、tilt≈0）；前进 1.4 m（pitch < 2°）；超限自动 `→ joint_damping → idle`。
+- **接管质量（harness 新增打印）**：交棒瞬间关节误差 0.017–0.018 rad、tilt 0.2°；接管 0.2 s 后估计高度 0.3402–0.3405 m、置信度 1.00、支撑腿 4。
+- **实测量（站立 20 s，1 kHz 路径）**：
+
+| 项 | 实测 | 说明 |
+| --- | --- | --- |
+| `step_ms` | mean 0.501–0.509 / p50 0.49–0.52 / p99 0.58–0.74 / max 4.6–15.3 | > 1 ms 的帧 0.17–0.21%（34–41/19620），max 是 OS 抢占，非算法 |
+| MPC 线程 `mpc_ms` | mean 2.67–2.76 / max 3.05 | 20 Hz，完全在旁路 |
+| `wrench_age` | mean 29.6 ms / max 57 ms | 阈值 150 ms；站立时 `num_support` 恒 4 |
+| 硬约束残差 | eom ≤ 2.8e-14 / contact ≤ 3.4e-16 / cone = 0 | WBC QP（内点）|
+| 力矩 / 法向力 | τ 峰值 4.5 N·m（限 30）/ `Σfz` mean 117 N | `mg = 11.9376×9.81 = 117.1 N` |
+| WBC 激活率 | 99.8% | 计入 0.5 s 起立接管窗 |
+
+- **踩坑（按发生顺序，均为实测定位）**：
+  1. **`τ_ff` 在 WBC 未使能时必须为 0**：`τ_ff = τ_total − PD` 若在未使能时照样下发，等于把 PD 反向叠加一次，再被 `±30` 夹住 → 起立段凭空多出 `−30 N·m`，直接顶翻。
+  2. **起立不能靠控制器斜坡**：从趴地姿势直接插值到站姿会翻（实测两种结局：站起 / 后仰 46° 坐倒）。分工定为：真机路径交给 `StandUpState` 两阶段（收腿到 `pre_height=0.12` → 按高度映射抬到 `stand_height=0.33`），harness 复刻同一套 `HipYByHeight/KneeByHeight`；控制器的 `stand_ramp_time/stand_settle_time` 只是接管后的平滑。
+  3. **MPC 抖动必须离开 1 kHz 线程**：`BoxQp` 在退化点会跑 2100 次迭代（残差 9e-4、单次 10–48 ms）。搬到 `MpcWorkerThread` 后 1 kHz 路径 p99 由 1.24 ms 降到 0.53 ms，站立 20 s 零帧超 1 ms（当时配置）。
+  4. **WBC 使能滞回**：估计有效位逐帧抖动会让 WBC 一开一关（切换同时改 PD×2 与 τ_ff，比撑着跑更糟）。`wbc_enable_hold_frames=40`；姿态门 `wbc_enable_tilt` 也应落在滞回窗内（`tilt ∈ (0.35, 0.8]` 是「还想试一把」区），只有超 `tilt_limit=0.8` 才立即失效 —— 离线自检最初 4 个 failure 里就有这一条。
+  5. **命令平滑必须「先低通后限幅」**：先限幅再低通 = 两个滞后串联，命令 0.2 s 只爬到 0.0006 m/s（会被误判成"平滑没用/阶跃照旧"）；改为先一阶低通（`tau=0.25 s`）后变化率限幅（`0.8 m/s²`、`2.0 rad/s²`）后与理论值 0.1101 对上（实测 0.1103）。另：`dt ≤ 0` 的帧不推进平滑器（早期版本会瞬间取目标，平滑形同虚设）。
+  6. **质心高度命令要软启动**：`com_height_slew=0.06 m/s`。否则 engage 瞬间 MPC 看到 0.3 m 高度差会要 ~30 m/s² 竖直加速度，τ 顶到 28.7 N·m，偶发顶翻。
+  7. **harness 交棒不能只看时间**：某次起立慢半拍（交棒时 bz 0.162 m vs 站姿 0.346 m），控制器在半蹲状态被启用 → 必翻，却被误读成"控制律不稳"。改为**条件交棒**（关节误差 < 0.15 rad、tilt < 0.2 rad；超 1.5 s 宽限则报「起立未收敛」退出），修改后 4 次交棒误差均为 0.017–0.018 rad。**注意真机路径仍是按时间交棒**（见下边界）。
+- **边界 / 未解决问题（全部移交 S9）**：
+  - **trot 行走仍不稳（本步唯一未通过项）**：条件交棒后再跑 4 次全 FAIL，但失败点已分成两类：`walk_e` 前进段干净（0.493 m，roll 1.0°/pitch 1.3°）→ 在 `stop1`（命令回零）0.54 s 后翻；`walk_a/c/d` 前进 0.49–0.77 m 后（进入 `walk_fwd` 1.8–2.6 s）pitch/roll 发散（tilt 46–155°）。修复前的对照是 1 PASS / 2 FAIL，说明**波动来自行走层而非编排层**。
+  - **失稳前后的实测特征（`walk_e`，交棒后到 fault）**：MPC `iters` 由站立时的 0（命中「无约束解已可行」快速返回）涨到 mean 75 / max 2100，`qp_residual` 1e-14 → 6.1e-5，`mpc_ms` max 33 ms；`Σfz` 峰值 224 N（≈1.9 mg）；`|a_des_z|` 11.1 m/s²、`|alpha_des_y|` 12.3 rad/s²；`|τ_ff|` 打到 30 N·m 上限；估计 `num_support` 一度掉到 1。
+  - 参考工程 docs/03 §12.4/§12.5 记录过同类未解决问题（fwd 段 roll 极限环，疑为触地冲击 × 无滑硬约束耦合）——本工程复现了同一现象，故不再在 S8 内继续试参数。
+  - **状态机路径的起立→MPC 交棒是按时间**（[`standup_state.hpp:140`](../state_machine/standup_state.hpp:140) 的 `2*stand_duration_`），没有收敛判据，与坑 7 同类；S9 一并处理。
+  - `w_base/w_swing`、PD scale、步态 `T/duty/抬脚` 均未在闭环整定；1 kHz 单帧仍有 0.17–0.21% 帧超时（OS 抢占，真机需 RT 优先级）。
 
 ### S1 运动学 FK / IK / 雅可比（✅ 已通过）
 

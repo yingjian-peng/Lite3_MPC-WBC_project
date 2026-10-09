@@ -17,6 +17,7 @@
 #include "liedown_state.hpp"
 
 #include "rl_control_state_onnx.hpp"
+#include "mpc_control_state.hpp"
 
 #include "skydroid_gamepad_interface.hpp"
 #include "retroid_gamepad_interface.hpp"
@@ -37,6 +38,8 @@ private:
     std::shared_ptr<StateBase> idle_controller_;
     std::shared_ptr<StateBase> standup_controller_;
     std::shared_ptr<StateBase> rl_controller_;
+    std::shared_ptr<StateBase> rl_controller_onnx_;   // 原 ONNX 策略状态
+    std::shared_ptr<StateBase> mpc_controller_;       // S8 MPC+WBC 状态
     std::shared_ptr<StateBase> joint_damping_controller_;
     std::shared_ptr<StateBase> liedown_controller_;
 
@@ -142,7 +145,20 @@ public:
         idle_controller_ = std::make_shared<IdleState>(robot_type, "idle_state", data_ptr);
         standup_controller_ = std::make_shared<StandUpState>(robot_type, "standup_state", data_ptr);
 
-        rl_controller_ = std::make_shared<RLControlStateONNX>(robot_type, "rl_control", data_ptr);
+        // 启动配置：onnx（默认）或 mpc_wbc（LITE3_CONTROL_PATH=mpc_wbc）。
+        // 两条路径**互斥构造**：选 MPC 时不构造 ONNX 状态（ONNX 构造会立刻加载 policy.onnx，
+        // 缺文件会直接抛异常终止），反之亦然。
+        const char* ctrl_path = std::getenv("LITE3_CONTROL_PATH");
+        const bool use_mpc = (ctrl_path != nullptr && std::string(ctrl_path) == "mpc_wbc");
+        if (use_mpc) {
+            mpc_controller_ = std::make_shared<MPCControlState>(robot_type, "mpc_wbc_control", data_ptr);
+            rl_controller_ = mpc_controller_;
+        } else {
+            rl_controller_onnx_ = std::make_shared<RLControlStateONNX>(robot_type, "rl_control", data_ptr);
+            rl_controller_ = rl_controller_onnx_;
+        }
+        std::cout << "Control path: " << (use_mpc ? "mpc_wbc (MPC+WBC)" : "onnx (RL policy)")
+                  << std::endl;
         
 
 

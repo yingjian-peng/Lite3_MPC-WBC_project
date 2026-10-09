@@ -78,7 +78,7 @@ target_include_directories(run_policy PUBLIC
 target_link_libraries(run_policy onnxruntime)
 
 add_executable(rl_deploy main.cpp state_machine/parameters/lite3_control_parameters.cpp)
-target_link_libraries(rl_deploy run_policy interface pthread m rt dl stdc++)
+target_link_libraries(rl_deploy run_policy interface mpc_wbc pthread m rt dl stdc++)
 
 if(BUILD_SIM)
   target_compile_definitions(rl_deploy PRIVATE BUILD_SIMULATION)
