@@ -125,6 +125,16 @@ inline double WrapToPi(double a) {
     return a;
 }
 
+/// 欧拉角 (roll, pitch, yaw)（ZYX 顺序，与 MuJoCo/仿真一致）-> R_WB。
+inline Mat3d RpyToRotation(const Vec3d& rpy) {
+    Mat3d Rz;
+    const double c = std::cos(rpy(2)), s = std::sin(rpy(2));
+    Rz << c, -s, 0.0,
+          s, c, 0.0,
+          0.0, 0.0, 1.0;
+    return Rz * RotationY(rpy(1)) * RotationX(rpy(0));
+}
+
 /// 绕单位轴 axis 旋转 angle 的旋转矩阵（Rodrigues 公式）。
 inline Mat3d AxisAngle(const Vec3d& axis, double angle) {
     const Mat3d K = Skew(axis);

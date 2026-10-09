@@ -24,6 +24,8 @@ if(BUILD_MPC_WBC_TESTS)
   target_link_libraries(lite3_dynamics_test PRIVATE mpc_wbc)
   add_executable(lite3_gait_trajectory_test test/lite3_gait_trajectory_test.cpp)
   target_link_libraries(lite3_gait_trajectory_test PRIVATE mpc_wbc)
+  add_executable(lite3_state_estimator_test test/lite3_state_estimator_test.cpp)
+  target_link_libraries(lite3_state_estimator_test PRIVATE mpc_wbc)
   add_test(NAME mpc_wbc_gait_trajectory COMMAND lite3_gait_trajectory_test)
 
   find_program(PYTHON3_EXECUTABLE python3)
@@ -54,6 +56,20 @@ if(BUILD_MPC_WBC_TESTS)
     set_tests_properties(mpc_wbc_dynamics PROPERTIES
       WORKING_DIRECTORY ${WORKSPACE_DIR}
       FIXTURES_REQUIRED mpc_wbc_dyn_cases)
+
+    set(MPC_WBC_EST_CASES ${CMAKE_BINARY_DIR}/mpc_wbc_estimator_rollout.csv)
+    add_test(NAME mpc_wbc_gen_estimator_rollout
+      COMMAND ${PYTHON3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_estimator_rollout.py
+              ${MPC_WBC_EST_CASES} 10)
+    add_test(NAME mpc_wbc_state_estimator
+      COMMAND lite3_state_estimator_test ${MPC_WBC_EST_CASES})
+    set_tests_properties(mpc_wbc_gen_estimator_rollout PROPERTIES
+      WORKING_DIRECTORY ${WORKSPACE_DIR}
+      FIXTURES_SETUP mpc_wbc_est)
+    set_tests_properties(mpc_wbc_state_estimator PROPERTIES
+      WORKING_DIRECTORY ${WORKSPACE_DIR}
+      FIXTURES_REQUIRED mpc_wbc_est)
   else()
     message(WARNING "python3 not found: MPC/WBC test executables are built, "
                     "but the MuJoCo table-check tests are not registered")
