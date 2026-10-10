@@ -44,6 +44,33 @@ double SmoothStep(double x) {
     return x * x * (3.0 - 2.0 * x);
 }
 
+/// 以最大变化量向目标靠近（docs/03 §7.1 的 `Approach`，参考实现同名）。
+double Approach(double current, double target, double max_delta) {
+    const double d = target - current;
+    if (std::fabs(d) <= max_delta) return target;
+    return current + (d >= 0.0 ? max_delta : -max_delta);
+}
+
+/// 步幅限幅：Δp_leg = t_stance·(v_cmd + ω×p0_xy) 对各轴线性，故按「各腿各轴超出比例的最大值」
+/// 统一缩放命令即可（与参考实现「步长限幅」等价）。
+GaitCommand LimitStep(const GaitCommand& in, double t_stance, const Vec12d& nominal, double step_x,
+                      double step_y) {
+    double s = 1.0;
+    for (int leg = 0; leg < kNumLegs; ++leg) {
+        const Vec3d p0 = nominal.segment<3>(3 * leg);
+        const double px = p0.x(), py = p0.y();
+        const double dpx = t_stance * (in.vx - in.wz * py);
+        const double dpy = t_stance * (in.vy + in.wz * px);
+        if (step_x > 0.0 && std::fabs(dpx) > step_x) s = std::min(s, step_x / std::fabs(dpx));
+        if (step_y > 0.0 && std::fabs(dpy) > step_y) s = std::min(s, step_y / std::fabs(dpy));
+    }
+    GaitCommand out;
+    out.vx = in.vx * s;
+    out.vy = in.vy * s;
+    out.wz = in.wz * s;
+    return out;
+}
+
 /// 起立段固定为 settle/stand/hold（与 S8 harness 的 settle/fold/raise/hold 等价分工），
 /// 之后接运动段：默认内置六方向序列，或 S9_SCENARIO 指定的场景文件（与 MPC 侧同一份）。
 std::vector<Phase> BuildPhases() {
@@ -93,6 +120,22 @@ int main(int argc, char** argv) {
     GaitParams gait_params;
     double stance_press = 0.0;  // 支撑相把足端 z 额外下压 [m]（软接触下提高接地可靠性）
     double cmd_scale = 1.0;     // 命令缩放（用于摸「开环稳定速度区间」）
+
+    // ---- docs/03 §7 那套 M0/M1 工程细节（默认全关，保持当前基线；给了值就按参考实现跑）----
+    // 参考值：死区 0.06、命令斜坡 2.5 /s、起步足端混合 1.0 s、关节目标速率限幅 6 rad/s、
+    // 步幅限幅 stepX/stepY = 0.10/0.035 m、M1 增益 0.5/0.5/0.5 + 一阶低通 0.05 s + 单脚限幅 0.04 m。
+    double deadzone = 0.0;      // S4_DEADZONE
+    double cmd_rate = 0.0;      // S4_RAMP
+    double blend_win = 0.0;     // S4_BLEND
+    double jv_rate = 0.0;       // S4_JV_RATE
+    double step_x = 0.0;        // S4_STEP_X
+    double step_y = 0.0;        // S4_STEP_Y
+    bool m1_on = false;         // S4_M1
+    double m1_gh = 0.5, m1_gr = 0.5, m1_gp = 0.5;
+    // 符号默认按**本工程约定**标定（y 向左、roll>0 = 左侧抬起、pitch>0 = 机头向下）：
+    // 参考实现（docs/03 §7.3）用的是 SIGN_ROLL=-1，那是给他们那台机器的约定；照搬会把 roll
+    // 波动放大（roll_sd 0.64°→0.95°、尖峰 3.4°→4.4°），见 docs/04 §8「S9 第五项」。
+    double m1_tau = 0.05, m1_dz = 0.04, m1_sr = 1.0, m1_sp = 1.0;
     if (const char* e = std::getenv("S4_KP")) kp = std::atof(e);
     if (const char* e = std::getenv("S4_KD")) kd = std::atof(e);
     if (const char* e = std::getenv("S4_SWING_HEIGHT")) gait_params.swing_height = std::atof(e);
@@ -100,6 +143,20 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("S4_PERIOD")) gait_params.period = std::atof(e);
     if (const char* e = std::getenv("S4_STANCE_PRESS")) stance_press = std::atof(e);
     if (const char* e = std::getenv("S4_CMD_SCALE")) cmd_scale = std::atof(e);
+    if (const char* e = std::getenv("S4_DEADZONE")) deadzone = std::atof(e);
+    if (const char* e = std::getenv("S4_RAMP")) cmd_rate = std::atof(e);
+    if (const char* e = std::getenv("S4_BLEND")) blend_win = std::atof(e);
+    if (const char* e = std::getenv("S4_JV_RATE")) jv_rate = std::atof(e);
+    if (const char* e = std::getenv("S4_STEP_X")) step_x = std::atof(e);
+    if (const char* e = std::getenv("S4_STEP_Y")) step_y = std::atof(e);
+    if (const char* e = std::getenv("S4_M1")) m1_on = std::atoi(e) != 0;
+    if (const char* e = std::getenv("S4_M1_GAIN_H")) m1_gh = std::atof(e);
+    if (const char* e = std::getenv("S4_M1_GAIN_ROLL")) m1_gr = std::atof(e);
+    if (const char* e = std::getenv("S4_M1_GAIN_PITCH")) m1_gp = std::atof(e);
+    if (const char* e = std::getenv("S4_M1_TAU")) m1_tau = std::atof(e);
+    if (const char* e = std::getenv("S4_M1_DZ_LIM")) m1_dz = std::atof(e);
+    if (const char* e = std::getenv("S4_M1_SIGN_ROLL")) m1_sr = std::atof(e);
+    if (const char* e = std::getenv("S4_M1_SIGN_PITCH")) m1_sp = std::atof(e);
     // 起始方式：standing（默认）= 仿真从站立平衡位开始，本程序从第一帧就保持站立构型；
     // drop = 旧的「零力矩落地 + 关节空间起立斜坡」，需配合 SIM_INIT_POSE=drop 使用。
     const bool start_standing =
@@ -163,6 +220,16 @@ int main(int argc, char** argv) {
     int status = 0;
 
     double last_t = -1.0;
+    double last_rel = 0.0;                     // 上一周期的 rel（算实际 dt，给斜坡/速率限幅用）
+    double last_rel_jv = 0.0;
+    const Vec12d nominal_feet = gait.nominal_feet();
+    GaitCommand cmd_filt;                      // S4_RAMP 的滤波状态
+    bool gait_was_stepping = false;            // 步态起步沿检测（起步混合 / M1 期望高度）
+    double t_gait_start = 0.0;
+    Eigen::Matrix<double, 3, kNumLegs> feet_at_start;
+    double h_des = 0.0;
+    Vec3d rpy_lp = Vec3d::Zero();              // M1 一阶低通状态
+    bool lp_init = false;
     while (true) {
         next_tick += period;
         std::this_thread::sleep_until(next_tick);
@@ -222,8 +289,71 @@ int main(int argc, char** argv) {
                 q_des = (1.0 - s) * q_start + s * stand;
             }
         } else {
-            // 步态 + IK
-            const auto legs = gait.Update(rel, phases[idx].cmd);
+            // ---- 命令预处理（docs/03 §7.1/§7.2：死区 -> 步幅限幅 -> 斜坡滤波）----
+            const double dt_ctrl = std::max(1e-6, rel - last_rel);
+            last_rel = rel;
+            GaitCommand cmd = phases[idx].cmd;
+            if (deadzone > 0.0) {
+                if (std::fabs(cmd.vx) <= deadzone) cmd.vx = 0.0;
+                if (std::fabs(cmd.vy) <= deadzone) cmd.vy = 0.0;
+                if (std::fabs(cmd.wz) <= deadzone) cmd.wz = 0.0;
+            }
+            if (step_x > 0.0 || step_y > 0.0)
+                cmd = LimitStep(cmd, gait_params.period * gait_params.duty, nominal_feet, step_x, step_y);
+            if (cmd_rate > 0.0) {
+                const double md = cmd_rate * dt_ctrl;
+                cmd_filt.vx = Approach(cmd_filt.vx, cmd.vx, md);
+                cmd_filt.vy = Approach(cmd_filt.vy, cmd.vy, md);
+                cmd_filt.wz = Approach(cmd_filt.wz, cmd.wz, md);
+                cmd = cmd_filt;
+            }
+
+            // 步态 + 起步足端混合（1 s smoothstep：从进入步态时的实测脚位混到规划轨迹）+ M1
+            auto legs = gait.Update(rel, cmd);
+            const bool stepping = gait.stepping();
+            if (stepping && !gait_was_stepping) {
+                t_gait_start = rel;
+                feet_at_start = model.FootPositionsBody(q_meas);
+                double zsum = 0.0;
+                int nst = 0;
+                for (int leg = 0; leg < kNumLegs; ++leg)
+                    if (legs[leg].contact) { zsum += feet_at_start(2, leg); ++nst; }
+                h_des = (nst > 0) ? model.geo.foot_radius - zsum / nst : 0.0;
+            }
+            gait_was_stepping = stepping;
+
+            const double alpha = (blend_win > 0.0 && stepping)
+                                     ? SmoothStep((rel - t_gait_start) / blend_win)
+                                     : 1.0;
+            for (int leg = 0; leg < kNumLegs; ++leg)
+                if (alpha < 1.0)
+                    legs[leg].foot_pos = (1.0 - alpha) * feet_at_start.col(leg) + alpha * legs[leg].foot_pos;
+
+            // M1：机身高度/姿态补偿（只改支撑脚目标 z，docs/03 §7.3）
+            if (m1_on && stepping) {
+                const Vec3f rpy_raw = ri->GetImuRpy();
+                if (!lp_init) { lp_init = true; rpy_lp = rpy_raw.cast<double>(); }
+                const double a = dt_ctrl / (m1_tau + dt_ctrl);
+                rpy_lp = (1.0 - a) * rpy_lp + a * rpy_raw.cast<double>();
+                double h_meas = 0.0;
+                int nst = 0;
+                for (int leg = 0; leg < kNumLegs; ++leg)
+                    if (legs[leg].contact) {
+                        h_meas += model.FootPositionBody(leg, q_meas.segment<3>(3 * leg)).z();
+                        ++nst;
+                    }
+                const double h_err = (nst > 0) ? (model.geo.foot_radius - h_meas / nst) - h_des : 0.0;
+                for (int leg = 0; leg < kNumLegs; ++leg) {
+                    if (!legs[leg].contact) continue;  // 只改支撑脚
+                    const double lever_x = legs[leg].foot_pos.x();
+                    const double lever_y = legs[leg].foot_pos.y();
+                    double dz = m1_gh * h_err + m1_sr * m1_gr * (lever_y * rpy_lp(0)) -
+                                m1_sp * m1_gp * (lever_x * rpy_lp(1));
+                    dz = std::max(-m1_dz, std::min(m1_dz, dz));
+                    legs[leg].foot_pos.z() += dz;
+                }
+            }
+
             for (int leg = 0; leg < kNumLegs; ++leg) {
                 Vec3d foot = legs[leg].foot_pos;
                 if (legs[leg].contact && stance_press > 0.0) foot.z() -= stance_press;
@@ -235,6 +365,13 @@ int main(int argc, char** argv) {
                     q_des.segment<3>(3 * leg) = q_des_prev.segment<3>(3 * leg);  // 兜底：沿用上一帧
             }
         }
+
+        // 关节目标速率限幅（docs/03 §7.1：6 rad/s，防 PD 速度项过大）
+        if (jv_rate > 0.0) {
+            const double md = jv_rate * std::max(1e-6, rel - last_rel_jv);
+            for (int i = 0; i < 12; ++i) q_des(i) = Approach(q_des_prev(i), q_des(i), md);
+        }
+        last_rel_jv = rel;
 
         // 关节位置限幅
         for (int leg = 0; leg < kNumLegs; ++leg)
