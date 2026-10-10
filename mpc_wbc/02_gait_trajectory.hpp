@@ -29,7 +29,10 @@ namespace mpc_wbc {
 struct GaitParams {
     double period = 0.60;        // 步态周期 T [s]
     double duty = 0.68;          // 支撑占空比 d
-    double swing_height = 0.06;  // 摆动抬脚高度 H [m]
+    // 摆动抬脚高度 H [m]。0.06 → 0.10：实测开环（位置环）下 0.06 只能得到 ~3–5 cm 的实际
+    // 净空（软接触下沉 + 关节跟踪滞后各吃掉一部分），摆动脚会刮地、把身体推着走；提到 0.10 后
+    // 稳态速度从命令的 0.65 倍升到 0.95 倍、足端滑移从 0.082 降到 0.052 m/s（见 docs/04 §7 第 6 项）。
+    double swing_height = 0.10;
 
     // 速度命令上限（把归一化 [-1,1] 映射到物理单位）
     double max_vx = 0.20;  // m/s

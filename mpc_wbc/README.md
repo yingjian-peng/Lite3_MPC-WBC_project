@@ -98,6 +98,17 @@ mpc_wbc/test/run_s4_position_loop.sh 24     # 启动无头仿真 + 控制器 + �
 
 脚本默认关闭 viewer（`MUJOCO_VIEWER=0`）；手动可视化时先 `python3 interface/robot/simulation/mujoco_simulation.py`，再运行 `build/mpc_wbc/mpc_wbc_position_loop_sim`。
 
+开环调参旋钮（环境变量，默认值见 [docs/04](../docs/04_Lite3_MPC_WBC实现步骤与里程碑.md) §8「S9 第三项」）：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `S4_KP` / `S4_KD` | 200 / 2.5 | 关节 PD 增益。**kp 100→200** 让稳态速度从命令的 0.65 倍升到 0.95 倍；kp 300 会打到 30 N·m 限幅反而变差 |
+| `S4_SWING_HEIGHT` | 0.10 | 摆动抬脚高度 [m]。**0.06→0.10** 让实际净空从 3–5 cm 升到 ~10 cm，滑移 0.082→0.052 m/s |
+| `S4_DUTY` / `S4_PERIOD` | 0.68 / 0.60 | 支撑占空比 / 步态周期（实测对速度影响很小或为负） |
+| `S4_STANCE_PRESS` | 0 | 支撑相把足端 z 额外下压 [m]（软接触下想提高接地可靠性用；实测无收益） |
+| `S4_CMD_SCALE` | 1.0 | 命令缩放，用于摸开环的稳定速度区间 |
+
+
 ### 运行 S8 整机 MPC+WBC（MuJoCo，无头）
 
 ```bash

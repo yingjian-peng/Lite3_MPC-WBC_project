@@ -82,7 +82,23 @@ std::vector<Phase> BuildPhases() {
 
 int main(int argc, char** argv) {
     const std::string phases_csv = (argc > 1) ? argv[1] : "s4_phases.csv";
-    const double kp = 100.0, kd = 2.5;  // docs/03 附录 C
+    // kp/kd：docs/03 附录 C 给的是 100/2.5；实测（仅足端接触模型、抬脚 0.10 m）把 kp 提到 200
+    // 让稳态速度从命令的 0.65 倍升到 0.95 倍（峰值力矩 18.4 N·m，限幅 30 N·m 有余量）。
+    // 再往上（kp300）会打到限幅、滑移回升、位移反而掉到 0.75 倍 —— 200 是拐点。
+    double kp = 200.0, kd = 2.5;
+    // 开环调参旋钮（docs/04 §7）：步态形状与 PD 增益、支撑相竖直预压。
+    // 开环能走多快基本由「支撑脚是否真的钉住 + 摆动脚是否真的离地」决定，
+    // 所以这几个量要能单独扫。
+    GaitParams gait_params;
+    double stance_press = 0.0;  // 支撑相把足端 z 额外下压 [m]（软接触下提高接地可靠性）
+    double cmd_scale = 1.0;     // 命令缩放（用于摸「开环稳定速度区间」）
+    if (const char* e = std::getenv("S4_KP")) kp = std::atof(e);
+    if (const char* e = std::getenv("S4_KD")) kd = std::atof(e);
+    if (const char* e = std::getenv("S4_SWING_HEIGHT")) gait_params.swing_height = std::atof(e);
+    if (const char* e = std::getenv("S4_DUTY")) gait_params.duty = std::atof(e);
+    if (const char* e = std::getenv("S4_PERIOD")) gait_params.period = std::atof(e);
+    if (const char* e = std::getenv("S4_STANCE_PRESS")) stance_press = std::atof(e);
+    if (const char* e = std::getenv("S4_CMD_SCALE")) cmd_scale = std::atof(e);
 
     auto ri = std::make_shared<SimulationInterface>("Lite3", 12);
     ri->Start();
@@ -98,10 +114,14 @@ int main(int argc, char** argv) {
     }
 
     Lite3Model model;
-    GaitTrajectory gait;
+    GaitTrajectory gait(gait_params);
     const Vec12d stand = Lite3Model::DefaultStandJointAngles();
 
-    const std::vector<Phase> phases = BuildPhases();
+    std::vector<Phase> phases = BuildPhases();
+    if (cmd_scale != 1.0) {
+        for (auto& p : phases) { p.cmd.vx *= cmd_scale; p.cmd.vy *= cmd_scale; p.cmd.wz *= cmd_scale; }
+        std::printf("[s4] command scaled by %.3f\n", cmd_scale);
+    }
     double total_duration = 0.0;
     for (const auto& p : phases) total_duration += p.duration;
 
@@ -169,9 +189,11 @@ int main(int argc, char** argv) {
             // 步态 + IK
             const auto legs = gait.Update(rel, phases[idx].cmd);
             for (int leg = 0; leg < kNumLegs; ++leg) {
+                Vec3d foot = legs[leg].foot_pos;
+                if (legs[leg].contact && stance_press > 0.0) foot.z() -= stance_press;
                 Vec3d seed = q_des_prev.segment<3>(3 * leg);
                 Vec3d q_leg;
-                if (model.InverseKinematics(leg, legs[leg].foot_pos, &q_leg, &seed))
+                if (model.InverseKinematics(leg, foot, &q_leg, &seed))
                     q_des.segment<3>(3 * leg) = q_leg;
                 else
                     q_des.segment<3>(3 * leg) = q_des_prev.segment<3>(3 * leg);  // 兜底：沿用上一帧
