@@ -107,6 +107,23 @@ mpc_wbc/test/run_s4_position_loop.sh 24     # 启动无头仿真 + 控制器 + �
 | `S4_DUTY` / `S4_PERIOD` | 0.68 / 0.60 | 支撑占空比 / 步态周期（实测对速度影响很小或为负） |
 | `S4_STANCE_PRESS` | 0 | 支撑相把足端 z 额外下压 [m]（软接触下想提高接地可靠性用；实测无收益） |
 | `S4_CMD_SCALE` | 1.0 | 命令缩放，用于摸开环的稳定速度区间 |
+| `S4_START` | `standing` | `standing`=仿真从站立平衡位开始、本程序第一帧就保持站姿；`drop`=旧的「零力矩落地 + 起立斜坡」（需配 `SIM_INIT_POSE=drop`） |
+| `S4_TRACE` | 空 | 给路径则逐控制周期 dump `iter,t,rel,phase_idx,cmd0..11`，用来定位「同一场景逐次结果不同」从第几周期开始分歧 |
+
+仿真侧环境变量（`interface/robot/simulation/mujoco_simulation.py`）：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `SIM_LOCKSTEP` | 1 | **收到一条新控制包才推进一步**（可重复性的前提，见下）；`=0` 回到墙钟步进 |
+| `SIM_LOCKSTEP_TIMEOUT` | 0.5 | 锁步下等不到新包的兜底时长 [s]，超时按墙钟推进，避免控制器退出后仿真卡死 |
+| `SIM_INIT_POSE` | `stand` | 初始位姿：`stand`=站立平衡位（站立高 0.3485 m + 关节 `(0,-0.65,1.3)`）；`drop`=旧的 MJCF 默认（1 m 高空 + URDF 折叠姿态） |
+| `SIM_INIT_HEIGHT` | 0.3485 | `stand` 模式的基座初始高度 [m] |
+| `SIM_HOLD_KP` / `SIM_HOLD_KD` | 200 / 5 | **收到第一帧控制包之前**用于保持初始姿态的内部 PD 增益（否则等待期间腿是软的，机器人先塌下去再被 PD 猛拉） |
+| `SIM_LEG_COLLISION` | `foot_only` | `foot_only`=只保留足端球接触（真实狗只有橡胶足端触地）；`full`=恢复小腿 mesh 碰撞 |
+| `SIM_INIT_YAW` | 0 | 初始航向 [rad，绕世界 z] |
+| `SIM_DURATION` | 0 | >0 时到点自动退出；S9 runner 按场景时长自动设定 |
+| `SIM_LOG` / `SIM_LOG_EVERY` | 空 / 10 | CSV 日志路径 / 采样间隔（步） |
+| `MUJOCO_VIEWER` | 1 | `=0` 无头 |
 
 
 ### 运行 S8 整机 MPC+WBC（MuJoCo，无头）
@@ -151,6 +168,15 @@ mpc_wbc/test/run_s9_ab.sh --only axis_fwd --init-yaw 1.5707963   # 起始航向 
 > 仿真日志（`SIM_LOG`）为配合 S9 A/B 扩了列：逐关节 `tau{i}`（PD+ff 计算值，未限幅）、`atau{i}`
 > （`ctrlrange` 夹取后**实际**力矩）、`fxall/fyall/fzall`（全部接触合力）、逐足 `f*{leg}`/`p*{leg}`
 > （世界系接触力与足心位置）。旧脚本按列名读取，不受影响。
+> **试验台协议（可重复性的前提）**：`mujoco_simulation.py` 默认 `SIM_LOCKSTEP=1`，即**收到一条新控制包才推进一步**；
+> 首包之前一步都不推进（初始状态就是构造出来的位姿本身，与「控制器何时启动」无关），但每 20 ms 重发同一份
+> 初始观测以免「控制器等首帧观测、仿真等首条命令」互相等死；控制器退出后按 `SIM_LOCKSTEP_TIMEOUT=0.5 s`
+> 兜底推进，避免仿真卡死。对应的 `simulation_interface.hpp` 从「1 kHz 盲目重发」改成「**每个观测恰好一条命令**」
+> （有 `cmd_seq_` 记录命令写入、`state_seq_` 记录观测到达），两个 harness 也都加了「同一观测只算一次」。
+> 不变式是 **一个观测 → 一条命令 → 一步仿真**。`SIM_LOCKSTEP=0` 可回到旧的墙钟步进（要可视化、不追复现时用），
+> `SIM_HOLD_KP`/`SIM_HOLD_KD`（默认 200/5）控制「首包之前」的内部 PD 保持增益。
+> 效果：同一场景三次跑出**逐位相同**的日志，起立/落地段指标在全部场景里一致（tilt 0.19°、bz 0.3437）。
+>
 > 注意：MuJoCo 名义站姿下 `*_SHANK_collision`（整条小腿的 mesh）也压在地面上——实测它承担约 **97%**
 > 的支撑力（每腿竖向 19–28 N）且接触法向倾斜约 20°（水平分量 −8~−12 N），足端球只承 1–5 N。真实狗只有
 > 橡胶足端球触地，所以这是一处**仿真模型 artifact**。行程里可用 `SIM_LEG_COLLISION=foot_only` 关掉小腿

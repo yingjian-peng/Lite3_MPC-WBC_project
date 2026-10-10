@@ -189,7 +189,9 @@ int main(int argc, char** argv) {
     const auto period = std::chrono::microseconds(1000);
     auto next_tick = std::chrono::steady_clock::now();
 
-    double last_seen_t = t0;
+    // 用 -1 起（时间戳从 >0 开始）：否则本程序启动时读到的那一拍会被判成"不是新观测"，
+    // 于是首条命令永远发不出去，而仿真锁步又在等命令 → 互相等死。
+    double last_seen_t = -1.0;
     auto last_seen_wall = std::chrono::steady_clock::now();
 
     while (true) {
@@ -200,7 +202,8 @@ int main(int argc, char** argv) {
         const double rel = t - t0;
         if (rel >= total_duration) break;
 
-        // 仿真掉线保护：时间戳不再前进超过 1 s 就退出（否则会一直空转）
+        // 仿真掉线保护 + 「同一观测只算一次」（理由同 S4 harness）：只有时间戳前进才走完本周期，
+        // 否则重复计算会得到种子略变的解，使下发哪一份命令取决于线程间的墙钟竞争。
         if (t > last_seen_t + 1e-12) {
             last_seen_t = t;
             last_seen_wall = std::chrono::steady_clock::now();
@@ -208,6 +211,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[s8] simulation stalled at t=%.2f (no new data for 1 s)\n", rel);
             status = 5;
             break;
+        } else {
+            continue;
         }
 
         // 当前阶段

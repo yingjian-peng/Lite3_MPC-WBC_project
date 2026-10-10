@@ -18,6 +18,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <atomic>
+#include <cstdint>
 #include <unistd.h>
 
 
@@ -29,6 +31,11 @@ namespace interface{
             VecXf joint_pos_, joint_vel_, joint_tau_;
             bool start_thread_flag_ = false;
             std::thread sim_thread_, send_thread_;
+            // 每个观测恰好下发一条命令：发送线程只在「有更新的观测」且「有新写入的命令」时发一包。
+            // 否则 1 kHz 定时器会盲目重发旧命令；与仿真锁步叠加后同一观测会被推进多步，
+            // 且命令可能陈旧一拍 → 同一场景逐次结果不可复现。
+            std::atomic<uint64_t> state_seq_{0};   // 收到的观测计数
+            std::atomic<uint64_t> cmd_seq_{0};     // 写入命令的计数
         public:
         SimulationInterface(const std::string& name, int dof_num=12):RobotInterface(name, dof_num){
             joint_pos_ = VecXf::Zero(dof_num_);
@@ -66,6 +73,7 @@ namespace interface{
         virtual void SetJointCommand(Eigen::Matrix<float, Eigen::Dynamic, 5> input){
             // (current torque, not last torque, video content slip of the tongue)
             joint_cmd_ = input;
+            cmd_seq_.fetch_add(1, std::memory_order_release);
         }
 
         virtual void Start(){
@@ -164,6 +172,7 @@ namespace interface{
                 joint_pos_ = Eigen::Map<VecXf>(data+11, 12); 
                 joint_vel_ = Eigen::Map<VecXf>(data+23, 12); 
                 joint_tau_ = Eigen::Map<VecXf>(data+35, 12); 
+                state_seq_.fetch_add(1, std::memory_order_relaxed);
 
                 // 打印接收到的数据
                 // std::cout << "Received data: " << run_time_ << std::endl;
@@ -221,6 +230,9 @@ namespace interface{
             float *data=new float[dof_num_*5];
             std::memset(data, 0, sizeof(float)*5*dof_num_);
 
+            // 每个观测只发一条命令（见成员注释）
+            uint64_t sent_state = 0, sent_cmd = 0;
+
             while(start_thread_flag_){
                 fds = epoll_wait(efd, evptr, 1, -1);    //阻塞监听，直到有事件发生
                 if(evptr[0].events & EPOLLIN){   
@@ -231,6 +243,12 @@ namespace interface{
                     else{
                     }               
                 }
+                const uint64_t st = state_seq_.load(std::memory_order_acquire);
+                const uint64_t cq = cmd_seq_.load(std::memory_order_acquire);
+                if (st == sent_state || cq == sent_cmd) continue;   // 无新观测 或 无新命令
+                sent_state = st;
+                sent_cmd = cq;
+
                 std::memcpy(data, joint_cmd_.data(), sizeof(float)*5*dof_num_);
 
                 sendto(sockfd, data, 5*dof_num_*sizeof(float), 0, (struct sockaddr*)&serverAddr, sizeof(serverAddr));

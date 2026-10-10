@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <cstdio>
 #include <fstream>
 #include <cstdlib>
@@ -99,6 +100,10 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("S4_PERIOD")) gait_params.period = std::atof(e);
     if (const char* e = std::getenv("S4_STANCE_PRESS")) stance_press = std::atof(e);
     if (const char* e = std::getenv("S4_CMD_SCALE")) cmd_scale = std::atof(e);
+    // 起始方式：standing（默认）= 仿真从站立平衡位开始，本程序从第一帧就保持站立构型；
+    // drop = 旧的「零力矩落地 + 关节空间起立斜坡」，需配合 SIM_INIT_POSE=drop 使用。
+    const bool start_standing =
+        std::string(std::getenv("S4_START") ? std::getenv("S4_START") : "standing") != "drop";
 
     auto ri = std::make_shared<SimulationInterface>("Lite3", 12);
     ri->Start();
@@ -118,6 +123,11 @@ int main(int argc, char** argv) {
     const Vec12d stand = Lite3Model::DefaultStandJointAngles();
 
     std::vector<Phase> phases = BuildPhases();
+    if (start_standing) {
+        // 名字只是为了日志/CSV 自解释，分析器按行号跳过前缀，不依赖名字
+        phases[0].name = "hold_stand_a";
+        phases[1].name = "hold_stand_b";
+    }
     if (cmd_scale != 1.0) {
         for (auto& p : phases) { p.cmd.vx *= cmd_scale; p.cmd.vy *= cmd_scale; p.cmd.wz *= cmd_scale; }
         std::printf("[s4] command scaled by %.3f\n", cmd_scale);
@@ -131,6 +141,18 @@ int main(int argc, char** argv) {
     pcsv << "phase,t_start,t_end,vx,vy,wz\n";
     pcsv.flush();
 
+    // 逐控制周期轨迹（env S4_TRACE=<path>）：排查「同一场景逐次结果不同」用——
+    // 看命令流从第几个周期开始分歧、以及周期数/时间戳是否 1:1。
+    std::ofstream tcsv;
+    const char* trace_path = std::getenv("S4_TRACE");
+    if (trace_path != nullptr) {
+        tcsv.open(trace_path);
+        tcsv << "iter,t,rel,phase_idx";
+        for (int i = 0; i < 12; ++i) tcsv << ",cmd" << i;
+        tcsv << "\n";
+    }
+    long long iter = 0;
+
     Vec12d q_start = stand;      // settle 结束时的关节角
     Vec12d q_des = stand;
     Vec12d q_des_prev = stand;
@@ -140,11 +162,16 @@ int main(int argc, char** argv) {
     auto next_tick = std::chrono::steady_clock::now();
     int status = 0;
 
+    double last_t = -1.0;
     while (true) {
         next_tick += period;
         std::this_thread::sleep_until(next_tick);
 
         const double t = ri->GetInterfaceTimeStamp();
+        // 同一观测只算一次：仿真侧锁步（每观测一步），重复计算会得到种子略变的 IK 解，
+        // 使「下发的是哪一份命令」取决于发送线程与主循环的墙钟竞争 → 逐次结果不可复现。
+        if (t <= last_t) continue;
+        last_t = t;
         const double rel = t - t0;
         if (rel >= total_duration) break;
 
@@ -176,15 +203,24 @@ int main(int argc, char** argv) {
         double eff_kp = kp, eff_kd = kd;
 
         if (idx == 0) {
-            // settle：自由下落/落地，不施加力矩
-            q_start = q_meas;
-            q_des = q_meas;
-            eff_kp = 0.0;
-            eff_kd = 0.0;
+            if (start_standing) {
+                // 仿真已从站立平衡位开始：本程序从第一帧就用 PD 保持站立构型
+                q_des = stand;
+            } else {
+                // settle：自由下落/落地，不施加力矩
+                q_start = q_meas;
+                q_des = q_meas;
+                eff_kp = 0.0;
+                eff_kd = 0.0;
+            }
         } else if (idx == 1) {
-            // 站立斜坡：关节空间平滑插值
-            const double s = SmoothStep(local / phases[1].duration);
-            q_des = (1.0 - s) * q_start + s * stand;
+            if (start_standing) {
+                q_des = stand;  // 已在站立构型，斜坡退化为保持
+            } else {
+                // 站立斜坡：关节空间平滑插值
+                const double s = SmoothStep(local / phases[1].duration);
+                q_des = (1.0 - s) * q_start + s * stand;
+            }
         } else {
             // 步态 + IK
             const auto legs = gait.Update(rel, phases[idx].cmd);
@@ -225,6 +261,12 @@ int main(int argc, char** argv) {
         ri->SetJointCommand(cmd);
 
         q_des_prev = q_des;
+
+        if (tcsv.is_open()) {
+            tcsv << iter++ << "," << std::setprecision(10) << t << "," << rel << "," << idx;
+            for (int i = 0; i < 12; ++i) tcsv << "," << q_des(i);
+            tcsv << "\n";
+        }
     }
 
     // 退出：停止接口线程并保持站姿（便于仿真继续稳定）

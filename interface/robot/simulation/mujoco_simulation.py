@@ -25,10 +25,27 @@ SIM_DURATION = float(os.environ.get("SIM_DURATION", "0"))  # >0 时到点自动�
 SIM_INIT_YAW = float(os.environ.get("SIM_INIT_YAW", "0"))  # 初始航向（rad，绕世界 z）
 DT = 0.001
 RENDER_INTERVAL = 10
+# 锁步（默认开）：收到一条新的控制包才推进一步，使 state -> cmd -> step 严格一一对应。
+# 否则仿真的 1 ms 步进和控制器 1 ms 发包是两个独立墙钟循环，同一状态可能配到不同命令
+# （±1 步的随机反馈延迟）→ 同一场景逐次结果不可复现（行走结果 0.30/0.34/0.16 m）。
+# 控制器退出后再也收不到包，用墙钟超时兜底推进，避免仿真卡死。
+SIM_LOCKSTEP = os.environ.get("SIM_LOCKSTEP", "1") != "0"
+SIM_LOCKSTEP_TIMEOUT = float(os.environ.get("SIM_LOCKSTEP_TIMEOUT", "0.5"))
 
 URDF_INIT = {
     "lite3": np.array([0, -1.35453, 2.54948] * 4, dtype=np.float32)
 }
+
+# 站立构型（与 mpc_wbc 的 `DefaultStandLegAngles` 一致）与「足端球刚好相切」的基座高度。
+STAND_LEG_ANGLES = (0.0, -0.65, 1.3)
+STAND_BASE_HEIGHT = 0.3485
+
+# 初始位姿模式：`stand`（默认）= 从站立平衡位开始；`drop` = 旧的 MJCF 默认
+# （基座抬到 1 m + URDF 折叠关节角，等价于「高空折叠坠落再自己撑起来」）。
+# 落地本身是确定的，但**自撑起**过程对控制帧时序极敏感，会给所有行走试验注入
+# 不可重复的初始条件（同一场景 0.34 m vs 0.80 m，见 docs/04 §8「S9 第三项」）。
+SIM_INIT_POSE = os.environ.get("SIM_INIT_POSE", "stand").strip()
+SIM_INIT_HEIGHT = float(os.environ.get("SIM_INIT_HEIGHT", str(STAND_BASE_HEIGHT)))
 
 # S9 诊断日志用：足端 body（顺序与 mpc_wbc 的腿序 FL, FR, HL, HR 一致）
 FOOT_BODY_NAMES = ("FL_FOOT", "FR_FOOT", "HL_FOOT", "HR_FOOT")
@@ -92,6 +109,14 @@ class MuJoCoSimulation:
         self.vel_cmd = np.zeros_like(self.kp_cmd)
         self.tau_ff = np.zeros_like(self.kp_cmd)
         self.input_tq = np.zeros_like(self.kp_cmd)
+        # 收到第一帧控制包之前用内部 PD 保持初始姿态（见 _apply_joint_torque）
+        self.received_cmd = False
+        self.cmd_seq = 0                # 收到的控制包计数（锁步推进用）
+        self.last_step_seq = 0          # 上次推进时用掉的控制包序号
+        self.step_deadline = 0.0
+        self.qpos_hold = self.data.qpos[7:7+self.dof_num].copy().reshape(-1, 1)
+        self.hold_kp = float(os.environ.get("SIM_HOLD_KP", "200"))
+        self.hold_kd = float(os.environ.get("SIM_HOLD_KD", "5"))
 
         # IMU
         self.last_base_linvel = np.zeros((3, 1), np.float64)
@@ -114,13 +139,22 @@ class MuJoCoSimulation:
         self.viewer.cam.lookat[:] = np.array([0.4, 0.0, 0.45])
 
     def _set_initial_pose(self, key: str):
-        """Set joint positions to match PyBullet initial angles."""
+        """初始位姿。默认从**站立平衡位**开始（关节 = 站立构型，基座 = 足端刚好相切的高度），
+        这样 A/B 试验的初始条件可重复；`SIM_INIT_POSE=drop` 恢复「高空折叠坠落」写法。"""
         qpos0 = self.data.qpos.copy()
-        qpos0[7:7+self.dof_num] = URDF_INIT[key]
+        if SIM_INIT_POSE == "stand":
+            qpos0[2] = SIM_INIT_HEIGHT
+            qpos0[7:7+self.dof_num] = np.tile(np.asarray(STAND_LEG_ANGLES, dtype=np.float64),
+                                              self.dof_num // 3)
+            print(f"[sim] 初始位姿=站立（基座 z={SIM_INIT_HEIGHT:.4f} m，关节={STAND_LEG_ANGLES}）")
+        else:
+            qpos0[7:7+self.dof_num] = URDF_INIT[key]
+            print("[sim] 初始位姿=drop（MJCF 默认：基座 1 m + URDF 折叠关节角）")
         if SIM_INIT_YAW != 0.0:  # S9：起始航向（只改基座偏航，姿态仍水平）
             qpos0[3:7] = [np.cos(0.5 * SIM_INIT_YAW), 0.0, 0.0, np.sin(0.5 * SIM_INIT_YAW)]
         self.data.qpos[:] = qpos0
         mujoco.mj_forward(self.model, self.data)
+        self.qpos_hold = self.data.qpos[7:7+self.dof_num].copy().reshape(-1, 1)
 
     def print_debug_info(self):
         """Consolidated function to print debug information with colors and aligned formatting."""
@@ -233,8 +267,32 @@ class MuJoCoSimulation:
         # Main simulation loop
         step = 0
         last_time = time.time()
+        last_pub = 0.0
         while True:
-            if time.time() - last_time >= DT:
+            if SIM_LOCKSTEP:
+                if not self.received_cmd:
+                    # 首包之前一步都不推进：此时初始状态 = 构造出来的位姿本身，
+                    # 与「控制器何时启动」无关（否则墙钟决定已走多少步 → 起立段不可复现）。
+                    # 但要周期性重发同一份初始观测，否则「控制器等首帧观测、仿真等首条命令」
+                    # 死锁（控制器通常晚几秒才启动，只发一次会丢在空端口上）。
+                    if time.time() - last_pub >= 0.02:
+                        last_pub = time.time()
+                        self.timestamp = DT
+                        self._send_robot_state(1)
+                    time.sleep(0.001)
+                    continue
+                # 收到新控制包才推进（与 last_step_seq 比，不能用「等计数再变一次」的写法，
+                # 那会吞掉一条命令；超时兜底：控制器提前退出后按墙钟推进，避免卡死）
+                if self.cmd_seq == self.last_step_seq and time.time() < self.step_deadline:
+                    time.sleep(0.0001)
+                    continue
+                self.last_step_seq = self.cmd_seq
+                self.step_deadline = time.time() + SIM_LOCKSTEP_TIMEOUT
+                do_step = True
+            else:
+                do_step = time.time() - last_time >= DT
+
+            if do_step:
                 last_time = time.time()
 
                 step += 1
@@ -288,11 +346,21 @@ class MuJoCoSimulation:
             self.vel_cmd = np.asarray(unpacked[self.dof_num * 3:self.dof_num * 4], dtype=np.float32).reshape(
                 self.dof_num, 1)
             self.tau_ff = np.asarray(unpacked[self.dof_num * 4:], dtype=np.float32).reshape(self.dof_num, 1)
+            self.received_cmd = True
+            self.cmd_seq += 1
 
     def _apply_joint_torque(self):
         # Current joint states
         q = self.data.qpos[7:7+self.dof_num].reshape(-1, 1)
         dq = self.data.qvel[6:6+self.dof_num].reshape(-1, 1)
+
+        if not self.received_cmd:
+            # 收到第一帧控制包之前：用内部 PD 保持**初始姿态**。
+            # 否则等待期间腿是软的（τ≡0）→ 机器人先塌下去，控制器一接管又把关节猛拉回目标
+            # （实测把机器人弹到 0.86 m），而且等待时长还受墙钟影响 → 初始条件不可重复。
+            self.input_tq = self.hold_kp * (self.qpos_hold - q) - self.hold_kd * dq
+            self.data.ctrl[:] = self.input_tq.flatten()
+            return
 
         # τ = kp*(q_d - q) + kd*(dq_d - dq) + τ_ff
         self.input_tq = (
