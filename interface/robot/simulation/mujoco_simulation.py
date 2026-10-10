@@ -57,13 +57,15 @@ class MuJoCoSimulation:
         self.model = mujoco.MjModel.from_xml_path(xml_full)
         self.model.opt.timestep = DT
 
-        # 可选：只让足端球与地面接触。本 MJCF 的小腿碰撞 mesh（`*_SHANK_collision`，与 visual
-        # 同一个 shank.STL）在名义站姿下也压地——实测它承担了 ~97% 的支撑力，且 mesh 三角面
-        # 接触的法向倾斜 ~20°，带来几十牛的**水平**支反力。这与 MPC/WBC 假设的「点足 + 竖直
-        # 法向 + 摩擦锥在足端」不是一回事，真实狗也只有橡胶足端球触地。
-        # SIM_LEG_COLLISION=foot_only 时关闭小腿碰撞，用于隔离这一模型差异（默认 off）。
-        self.leg_collision_mode = os.environ.get("SIM_LEG_COLLISION", "").strip()
-        if self.leg_collision_mode == "foot_only":
+        # 接触模型：**默认只让足端球与地面接触**。本 MJCF 的小腿碰撞 mesh（`*_SHANK_collision`，
+        # 与 visual 同一个 shank.STL，整条小腿）在名义站姿下也压地——实测它承担约 97% 的支撑力
+        # （每腿竖向 19–28 N）且 mesh 三角面接触的法向倾斜 ~20°，带来几十牛的**水平**支反力。这与
+        # 真实狗（只有橡胶足端球触地）以及 MPC/WBC 假设的「点足 + 竖直法向 + 摩擦锥在足端」都不符。
+        # （该 MJCF 里机器人各 geom 都是 contype=0/conaffinity=1，即本来就**没有**自碰撞，所以关掉这
+        #  几个 geom 的碰撞只影响「小腿 × 地面」这一对。）
+        # SIM_LEG_COLLISION=full 可恢复原来的行为（用于对照测量）。
+        self.leg_collision_mode = os.environ.get("SIM_LEG_COLLISION", "foot_only").strip()
+        if self.leg_collision_mode != "full":
             disabled = []
             for i in range(self.model.ngeom):
                 name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i) or ""
@@ -71,7 +73,8 @@ class MuJoCoSimulation:
                     self.model.geom_contype[i] = 0
                     self.model.geom_conaffinity[i] = 0
                     disabled.append(name)
-            print(f"[sim] SIM_LEG_COLLISION=foot_only：已关闭 {len(disabled)} 个小腿碰撞 geom")
+            print(f"[sim] 接触模型：只保留足端球（已关闭 {len(disabled)} 个小腿碰撞 geom；"
+                  f"SIM_LEG_COLLISION=full 可恢复）")
 
         self.data = mujoco.MjData(self.model)
 
