@@ -130,6 +130,10 @@ int main(int argc, char** argv) {
     double jv_rate = 0.0;       // S4_JV_RATE
     double step_x = 0.0;        // S4_STEP_X
     double step_y = 0.0;        // S4_STEP_Y
+    // 扫掠增益 λ（对应参考实现里"仿真传动效率<1 用 λ 慢积分标定"那一层）：
+    // λ 只放大**送进步态的**命令（=放大规划步幅），phases.csv 仍记原始意图，
+    // 所以分析口径依然是"实际速度 / 原始命令"，不会自我欺骗。
+    double sweep_gain = 1.0;    // S4_SWEEP_GAIN
     bool m1_on = false;         // S4_M1
     double m1_gh = 0.5, m1_gr = 0.5, m1_gp = 0.5;
     // 符号默认按**本工程约定**标定（y 向左、roll>0 = 左侧抬起、pitch>0 = 机头向下）：
@@ -149,6 +153,7 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("S4_JV_RATE")) jv_rate = std::atof(e);
     if (const char* e = std::getenv("S4_STEP_X")) step_x = std::atof(e);
     if (const char* e = std::getenv("S4_STEP_Y")) step_y = std::atof(e);
+    if (const char* e = std::getenv("S4_SWEEP_GAIN")) sweep_gain = std::atof(e);
     if (const char* e = std::getenv("S4_M1")) m1_on = std::atoi(e) != 0;
     if (const char* e = std::getenv("S4_M1_GAIN_H")) m1_gh = std::atof(e);
     if (const char* e = std::getenv("S4_M1_GAIN_ROLL")) m1_gr = std::atof(e);
@@ -297,6 +302,11 @@ int main(int argc, char** argv) {
                 if (std::fabs(cmd.vx) <= deadzone) cmd.vx = 0.0;
                 if (std::fabs(cmd.vy) <= deadzone) cmd.vy = 0.0;
                 if (std::fabs(cmd.wz) <= deadzone) cmd.wz = 0.0;
+            }
+            if (sweep_gain != 1.0) {
+                cmd.vx *= sweep_gain;
+                cmd.vy *= sweep_gain;
+                cmd.wz *= sweep_gain;
             }
             if (step_x > 0.0 || step_y > 0.0)
                 cmd = LimitStep(cmd, gait_params.period * gait_params.duty, nominal_feet, step_x, step_y);
