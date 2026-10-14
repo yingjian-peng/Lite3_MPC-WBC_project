@@ -240,8 +240,7 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_until(next_tick);
 
         const double t = ri->GetInterfaceTimeStamp();
-        // 同一观测只算一次：仿真侧锁步（每观测一步），重复计算会得到种子略变的 IK 解，
-        // 使「下发的是哪一份命令」取决于发送线程与主循环的墙钟竞争 → 逐次结果不可复现。
+        // 每个新时间戳只更新一次目标；仿真和命令发送各自按墙钟运行。
         if (t <= last_t) continue;
         last_t = t;
         const double rel = t - t0;

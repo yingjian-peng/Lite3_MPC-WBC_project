@@ -25,12 +25,8 @@ SIM_DURATION = float(os.environ.get("SIM_DURATION", "0"))  # >0 时到点自动�
 SIM_INIT_YAW = float(os.environ.get("SIM_INIT_YAW", "0"))  # 初始航向（rad，绕世界 z）
 DT = 0.001
 RENDER_INTERVAL = 10
-# 锁步（默认开）：收到一条新的控制包才推进一步，使 state -> cmd -> step 严格一一对应。
-# 否则仿真的 1 ms 步进和控制器 1 ms 发包是两个独立墙钟循环，同一状态可能配到不同命令
-# （±1 步的随机反馈延迟）→ 同一场景逐次结果不可复现（行走结果 0.30/0.34/0.16 m）。
-# 控制器退出后再也收不到包，用墙钟超时兜底推进，避免仿真卡死。
-SIM_LOCKSTEP = os.environ.get("SIM_LOCKSTEP", "1") != "0"
-SIM_LOCKSTEP_TIMEOUT = float(os.environ.get("SIM_LOCKSTEP_TIMEOUT", "0.5"))
+# 与 /home/robot/pengyingjian/rl_deploy 一致：MuJoCo 按墙钟独立步进，
+# 控制器和仿真各自运行；每步使用最近收到的关节命令。
 
 URDF_INIT = {
     "lite3": np.array([0, -1.35453, 2.54948] * 4, dtype=np.float32)
@@ -111,9 +107,6 @@ class MuJoCoSimulation:
         self.input_tq = np.zeros_like(self.kp_cmd)
         # 收到第一帧控制包之前用内部 PD 保持初始姿态（见 _apply_joint_torque）
         self.received_cmd = False
-        self.cmd_seq = 0                # 收到的控制包计数（锁步推进用）
-        self.last_step_seq = 0          # 上次推进时用掉的控制包序号
-        self.step_deadline = 0.0
         self.qpos_hold = self.data.qpos[7:7+self.dof_num].copy().reshape(-1, 1)
         self.hold_kp = float(os.environ.get("SIM_HOLD_KP", "200"))
         self.hold_kd = float(os.environ.get("SIM_HOLD_KD", "5"))
@@ -267,32 +260,8 @@ class MuJoCoSimulation:
         # Main simulation loop
         step = 0
         last_time = time.time()
-        last_pub = 0.0
         while True:
-            if SIM_LOCKSTEP:
-                if not self.received_cmd:
-                    # 首包之前一步都不推进：此时初始状态 = 构造出来的位姿本身，
-                    # 与「控制器何时启动」无关（否则墙钟决定已走多少步 → 起立段不可复现）。
-                    # 但要周期性重发同一份初始观测，否则「控制器等首帧观测、仿真等首条命令」
-                    # 死锁（控制器通常晚几秒才启动，只发一次会丢在空端口上）。
-                    if time.time() - last_pub >= 0.02:
-                        last_pub = time.time()
-                        self.timestamp = DT
-                        self._send_robot_state(1)
-                    time.sleep(0.001)
-                    continue
-                # 收到新控制包才推进（与 last_step_seq 比，不能用「等计数再变一次」的写法，
-                # 那会吞掉一条命令；超时兜底：控制器提前退出后按墙钟推进，避免卡死）
-                if self.cmd_seq == self.last_step_seq and time.time() < self.step_deadline:
-                    time.sleep(0.0001)
-                    continue
-                self.last_step_seq = self.cmd_seq
-                self.step_deadline = time.time() + SIM_LOCKSTEP_TIMEOUT
-                do_step = True
-            else:
-                do_step = time.time() - last_time >= DT
-
-            if do_step:
+            if time.time() - last_time >= DT:
                 last_time = time.time()
 
                 step += 1
@@ -347,7 +316,6 @@ class MuJoCoSimulation:
                 self.dof_num, 1)
             self.tau_ff = np.asarray(unpacked[self.dof_num * 4:], dtype=np.float32).reshape(self.dof_num, 1)
             self.received_cmd = True
-            self.cmd_seq += 1
 
     def _apply_joint_torque(self):
         # Current joint states

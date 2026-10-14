@@ -27,6 +27,7 @@ ONLY=""
 WHO="both"
 INIT_YAW=0
 RUN_REPORT=1
+FAILED=0
 CASES=(stand axis_fwd axis_back axis_left axis_right turn_left turn_right axis_fwd_long \
        mix_diag mix_yaw_fwd stop_reverse all_axes)
 
@@ -62,10 +63,10 @@ PREFIX_ROWS_MPC=4
 
 wait_port_free() {
   for _ in $(seq 1 60); do
-    ss -lun 2>/dev/null | grep -q ':30010 ' || return 0
+    if ! ss -lun 2>/dev/null | grep -Eq ':(20001|30010) '; then return 0; fi
     sleep 0.5
   done
-  return 0
+  return 1
 }
 
 # run_one <case> <who> <bin> <env...>
@@ -84,19 +85,38 @@ run_one() {
   local diag="$OUT/${tag}_diag.csv" applog="$OUT/${tag}_app.txt" js="$OUT/${tag}.json"
   rm -f "$sim_log" "$phases" "$diag" "$applog" "$js"
 
-  wait_port_free
+  if ! wait_port_free; then
+    echo "[s9] $tag: UDP 20001/30010 still occupied; skipping run" >&2
+    FAILED=1
+    return 1
+  fi
   MUJOCO_VIEWER=0 SIM_DEBUG=0 SIM_DURATION="$sim_dur" SIM_INIT_YAW="$INIT_YAW" \
     SIM_LOG="$sim_log" python3 "$SIM_SCRIPT" > "$OUT/${tag}_sim.txt" 2>&1 &
   local sim_pid=$!
   sleep 2
+  if ! kill -0 "$sim_pid" 2>/dev/null; then
+    echo "[s9] $tag: MuJoCo exited before controller start" >&2
+    tail -12 "$OUT/${tag}_sim.txt" >&2
+    wait "$sim_pid" 2>/dev/null
+    FAILED=1
+    return 1
+  fi
 
   echo "[s9] $tag: sim ${sim_dur}s, scenario $case_name"
+  local app_wall
+  app_wall=$(python3 -c "print(f'{$sim_dur * 3 + 15:.0f}s')")
   if [[ "$who" == "baseline" ]]; then
-    env S9_SCENARIO="$scen" "$bin" "$phases" > "$applog" 2>&1
+    timeout --signal=TERM --kill-after=2s "$app_wall" \
+      env S9_SCENARIO="$scen" "$bin" "$phases" > "$applog" 2>&1
   else
-    env S8_PHASES="$scen" "$bin" "$phases" "$diag" > "$applog" 2>&1
+    timeout --signal=TERM --kill-after=2s "$app_wall" \
+      env S8_PHASES="$scen" "$bin" "$phases" "$diag" > "$applog" 2>&1
   fi
   local app_status=$?
+  if [[ $app_status -eq 124 || $app_status -eq 137 ]]; then
+    echo "[s9] $tag: controller timed out (check MuJoCo log)" >&2
+    FAILED=1
+  fi
 
   kill "$sim_pid" 2>/dev/null
   wait "$sim_pid" 2>/dev/null
@@ -124,3 +144,4 @@ done
 if [[ $RUN_REPORT -eq 1 ]]; then
   python3 "$REPORT" --dir "$OUT" --out "$OUT/report.md" || echo "[s9] report failed"
 fi
+exit "$FAILED"
