@@ -248,15 +248,19 @@ int main(int argc, char** argv) {
     gait_schedule.low = gait_schedule.mid = gait_schedule.high = gait_params;
     // 2026-10-18 速度区间更新后的分段重扫（目标：降步频 + 增步幅 → 少抬腿、省电）：
     //   低速 1.20/0.72/0.07（0.83 Hz，1.33→0.83 Hz，步幅 +60%）
-    //   中速 1.05/0.70/0.07（0.95 Hz，1.59→0.95 Hz，步幅 +67%）
+    //   中速 0.75/0.70/0.07（1.33 Hz，步幅 +20%）
     //   高速 0.44/0.625/0.07（2.27 Hz，不变）
+    // 中速取 0.75 是为了三段周期接近等比（1.20 : 0.75 : 0.44 ≈ 1.60 : 1.70），
+    // 使段间过渡平缓；中速段的实测指标也是 0.75–0.90 四档里最好的
+    // （侧倾 2.5°、滑移 0.051、成本 0.105）。更慢的 1.05 虽省 2–5 W，
+    // 但会让 mid→high 的周期比拉到 2.4 倍。
     // 高速段为何不能降频：三轴组合（0.51/0.30/0.43）的偏航波动 p2pYaw 随步幅
     // 增长，T≥0.46 起就会越过 0.05 阈值；同一步幅下降低占空比同样会失稳
     // （0.46/0.63 与 0.50/0.58 均 WARN），因此高速段锁定 0.44/0.625。
     gait_schedule.low.period = 1.20;
     gait_schedule.low.duty = 0.72;
     gait_schedule.low.swing_height = 0.07;
-    gait_schedule.mid.period = 1.05;
+    gait_schedule.mid.period = 0.75;
     gait_schedule.mid.duty = 0.70;
     gait_schedule.mid.swing_height = 0.07;
     gait_schedule.high.period = 0.44;
