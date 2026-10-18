@@ -34,7 +34,10 @@ struct GaitParams {
     // 稳态速度从命令的 0.65 倍升到 0.95 倍、足端滑移从 0.082 降到 0.052 m/s（见 docs/04 §7 第 6 项）。
     double swing_height = 0.10;
 
-    // 速度命令上限（把归一化 [-1,1] 映射到物理单位）
+    // 速度命令上限（把归一化 [-1,1] 映射到物理单位）。
+    // 三段式设计目标见 docs/00：vx 0.60 / vy 0.35 / wz 0.50（方案 B 包络）。
+    // 当前实现只有一组 T/d/H，直接按高速上限运行会用错周期，因此这里保持
+    // 低速段安全上限；实现分段参数选择并通过验收后再放开。
     double max_vx = 0.20;  // m/s
     double max_vy = 0.15;  // m/s
     double max_wz = 0.30;  // rad/s
@@ -54,6 +57,105 @@ struct GaitCommand {
     double wz = 0.0;  // rad/s（绕机身 z）
 };
 
+/// 三段式步态参数：周期、占空比、抬腿高度按速度段独立整定。
+/// 主运动方向按 |vx|/max_vx、|vy|/max_vy、|wz|/max_wz 的最大分量判定；
+/// 段边界附近做平滑插值，避免步态参数跳变。
+struct SegmentedGaitParams {
+    GaitParams low;
+    GaitParams mid;
+    GaitParams high;
+
+    // 全局归一化上限（只用于判定主运动方向，不改变命令单位）。
+    double max_vx = 0.60;  // m/s
+    double max_vy = 0.35;  // m/s
+    double max_wz = 0.50;  // rad/s
+
+    // 主运动方向的分段边界（物理单位）。
+    double vx_low_mid = 0.20;   // m/s
+    double vx_mid_high = 0.35;  // m/s
+    double vy_low_mid = 0.15;   // m/s
+    double vy_mid_high = 0.22;  // m/s
+    double wz_low_mid = 0.20;   // rad/s
+    double wz_mid_high = 0.30;  // rad/s
+
+    // 边界插值带宽（物理单位）；0 表示直接切换。
+    double blend_vx = 0.02;   // m/s
+    double blend_vy = 0.015;  // m/s
+    double blend_wz = 0.02;   // rad/s
+
+    static double SmoothStep01(double x) {
+        x = std::max(0.0, std::min(1.0, x));
+        return x * x * (3.0 - 2.0 * x);
+    }
+
+    static GaitParams Blend(const GaitParams& a, const GaitParams& b, double alpha) {
+        alpha = std::max(0.0, std::min(1.0, alpha));
+        GaitParams r = a;
+        r.period = a.period + alpha * (b.period - a.period);
+        r.duty = a.duty + alpha * (b.duty - a.duty);
+        r.swing_height = a.swing_height + alpha * (b.swing_height - a.swing_height);
+        r.max_vx = std::max(a.max_vx, b.max_vx);
+        r.max_vy = std::max(a.max_vy, b.max_vy);
+        r.max_wz = std::max(a.max_wz, b.max_wz);
+        r.start_threshold = std::max(a.start_threshold, b.start_threshold);
+        r.stop_threshold = std::max(a.stop_threshold, b.stop_threshold);
+        // phase_offset 必须一致；默认沿用 a。
+        return r;
+    }
+
+    static GaitParams SelectAxis(double s, double b1, double b2, double blend,
+                                 const GaitParams& low, const GaitParams& mid,
+                                 const GaitParams& high) {
+        const double h = 0.5 * std::max(1e-9, blend);
+        if (s <= b1 - h) return low;
+        if (s < b1 + h)
+            return Blend(low, mid, SmoothStep01((s - (b1 - h)) / (2.0 * h)));
+        if (s <= b2 - h) return mid;
+        if (s < b2 + h)
+            return Blend(mid, high, SmoothStep01((s - (b2 - h)) / (2.0 * h)));
+        return high;
+    }
+
+    /// 选择当前命令对应的步态参数（含边界插值）。
+    GaitParams Select(const GaitCommand& cmd) const {
+        const double ax = std::fabs(cmd.vx) / std::max(1e-9, max_vx);
+        const double ay = std::fabs(cmd.vy) / std::max(1e-9, max_vy);
+        const double aw = std::fabs(cmd.wz) / std::max(1e-9, max_wz);
+        if (ax >= ay && ax >= aw)
+            return SelectAxis(std::fabs(cmd.vx), vx_low_mid, vx_mid_high, blend_vx,
+                              low, mid, high);
+        if (ay >= aw)
+            return SelectAxis(std::fabs(cmd.vy), vy_low_mid, vy_mid_high, blend_vy,
+                              low, mid, high);
+        return SelectAxis(std::fabs(cmd.wz), wz_low_mid, wz_mid_high, blend_wz,
+                          low, mid, high);
+    }
+
+    /// 返回 0=低速、1=中速、2=高速（不含边界插值，用于日志/选段）。
+    int SelectIndex(const GaitCommand& cmd) const {
+        const double ax = std::fabs(cmd.vx) / std::max(1e-9, max_vx);
+        const double ay = std::fabs(cmd.vy) / std::max(1e-9, max_vy);
+        const double aw = std::fabs(cmd.wz) / std::max(1e-9, max_wz);
+        double s = 0.0, b1 = 0.0, b2 = 0.0;
+        if (ax >= ay && ax >= aw) {
+            s = std::fabs(cmd.vx);
+            b1 = vx_low_mid;
+            b2 = vx_mid_high;
+        } else if (ay >= aw) {
+            s = std::fabs(cmd.vy);
+            b1 = vy_low_mid;
+            b2 = vy_mid_high;
+        } else {
+            s = std::fabs(cmd.wz);
+            b1 = wz_low_mid;
+            b2 = wz_mid_high;
+        }
+        if (s <= b1) return 0;
+        if (s <= b2) return 1;
+        return 2;
+    }
+};
+
 /// 单腿步态状态。
 struct LegGaitState {
     bool contact = true;             // 支撑相
@@ -65,12 +167,26 @@ struct LegGaitState {
 
 class GaitTrajectory {
 public:
-    explicit GaitTrajectory(const GaitParams& params = GaitParams()) : params_(params) {
+    explicit GaitTrajectory(const GaitParams& params = GaitParams(),
+                            const SegmentedGaitParams* schedule = nullptr)
+        : params_(params), schedule_(schedule) {
         InitNominal();
     }
 
     const GaitParams& params() const { return params_; }
     void set_params(const GaitParams& p) { params_ = p; }
+
+    /// 绑定三段式参数表；nullptr 表示使用固定 params_。
+    void SetSchedule(const SegmentedGaitParams* schedule) { schedule_ = schedule; }
+
+    /// 切换参数时保持当前步态相位连续，避免周期 T 改变导致相位跳变。
+    void SetParamsAt(double t, const GaitParams& p) {
+        if (stepping_ && params_.period > 1e-9 && p.period > 1e-9) {
+            const double phase = Wrap01((t - t_start_) / params_.period);
+            t_start_ = t - phase * p.period;
+        }
+        params_ = p;
+    }
 
     /// 名义足位（机体系，球心），由默认站立角 FK 得到；12 维，按 FL,FR,HL,HR 的 xyz 排列。
     const Vec12d& nominal_feet() const { return nominal_feet_; }
@@ -79,6 +195,13 @@ public:
     void SetNominalFromJointAngles(const Vec12d& q) {
         for (int leg = 0; leg < kNumLegs; ++leg)
             nominal_feet_.segment<3>(3 * leg) = model_.FootPositionBody(leg, q.segment<3>(3 * leg));
+    }
+
+    /// 标称足位整体平移（机体系）。用于按整机质心配平：官方模型质心在髋中心后方 7.2 mm，
+    /// 而默认站立角的标称落足中心在髋中心前方 6.1 mm，两者相差 13.3 mm，后腿长期偏载。
+    void ShiftNominal(const Vec3d& delta) {
+        for (int leg = 0; leg < kNumLegs; ++leg)
+            nominal_feet_.segment<3>(3 * leg) += delta;
     }
 
     /// 归一化 [-1,1] 命令 -> 物理单位（含死区）。
@@ -95,11 +218,12 @@ public:
         return cmd;
     }
 
-    /// 归一化速度：各轴相对上限的比值取最大。
+    /// 归一化速度：各轴相对其上限的比值取最大（用于起步/停步滞回）。
     double NormalizedSpeed(const GaitCommand& c) const {
-        const double v = std::hypot(c.vx, c.vy) / std::max(1e-9, params_.max_vx);
+        const double vx = std::fabs(c.vx) / std::max(1e-9, params_.max_vx);
+        const double vy = std::fabs(c.vy) / std::max(1e-9, params_.max_vy);
         const double w = std::fabs(c.wz) / std::max(1e-9, params_.max_wz);
-        return std::max(v, w);
+        return std::max({vx, vy, w});
     }
 
     bool stepping() const { return stepping_; }
@@ -113,6 +237,7 @@ public:
 
     /// 每控制周期调用一次：更新行走/停步滞回状态并返回四腿目标。
     std::array<LegGaitState, kNumLegs> Update(double t, const GaitCommand& cmd) {
+        if (schedule_ != nullptr) SetParamsAt(t, schedule_->Select(cmd));
         const double ns = NormalizedSpeed(cmd);
         if (!stepping_) {
             if (ns > params_.start_threshold) {
@@ -215,6 +340,7 @@ private:
     }
 
     GaitParams params_;
+    const SegmentedGaitParams* schedule_ = nullptr;
     Lite3Model model_;
     Vec12d nominal_feet_ = Vec12d::Zero();
     bool stepping_ = false;

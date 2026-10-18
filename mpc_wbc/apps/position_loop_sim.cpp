@@ -54,8 +54,7 @@ double Approach(double current, double target, double max_delta) {
 /// 步幅限幅：Δp_leg = t_stance·(v_cmd + ω×p0_xy) 对各轴线性，故按「各腿各轴超出比例的最大值」
 /// 统一缩放命令即可（与参考实现「步长限幅」等价）。
 GaitCommand LimitStep(const GaitCommand& in, double t_stance, const Vec12d& nominal, double step_x,
-                      double step_y) {
-    double s = 1.0;
+                      double step_y) {    double s = 1.0;
     for (int leg = 0; leg < kNumLegs; ++leg) {
         const Vec3d p0 = nominal.segment<3>(3 * leg);
         const double px = p0.x(), py = p0.y();
@@ -71,10 +70,39 @@ GaitCommand LimitStep(const GaitCommand& in, double t_stance, const Vec12d& nomi
     return out;
 }
 
+/// 方案 B 速度包络（docs/00 §9.3）：单轴区间 x 0.60 / y 0.35 / z 0.50，
+/// 并要求 s = hypot(vx,vy) + wz_weight·|wz| ≤ s_max（等价最差支撑步幅 ≤ 0.19 m）。
+/// 超出时三轴同比例缩比，保持运动方向不变；单轴裁剪与归一化缩比顺序无关。
+struct EnvelopeParams {
+    double vx_max = 0.60;      // m/s
+    double vy_max = 0.35;      // m/s
+    double wz_max = 0.50;      // rad/s
+    double s_max = 0.67;       // m/s（等效平移速度上限）
+    double wz_weight = 0.18;   // 转向折算成平移的权重 [m]
+    bool enabled = true;       // S4_ENV_LIMIT=0 可关闭
+};
+
+GaitCommand LimitEnvelope(const GaitCommand& in, const EnvelopeParams& env) {
+    GaitCommand out = in;
+    if (!env.enabled) return out;
+    if (env.vx_max > 0.0) out.vx = std::clamp(out.vx, -env.vx_max, env.vx_max);
+    if (env.vy_max > 0.0) out.vy = std::clamp(out.vy, -env.vy_max, env.vy_max);
+    if (env.wz_max > 0.0) out.wz = std::clamp(out.wz, -env.wz_max, env.wz_max);
+    if (env.s_max > 0.0) {
+        const double s = std::hypot(out.vx, out.vy) + env.wz_weight * std::fabs(out.wz);
+        if (s > env.s_max) {
+            const double k = env.s_max / s;
+            out.vx *= k;
+            out.vy *= k;
+            out.wz *= k;
+        }
+    }
+    return out;
+}
+
 /// 起立段固定为 settle/stand/hold（与 S8 harness 的 settle/fold/raise/hold 等价分工），
 /// 之后接运动段：默认内置六方向序列，或 S9_SCENARIO 指定的场景文件（与 MPC 侧同一份）。
-std::vector<Phase> BuildPhases() {
-    std::vector<Phase> p = {
+std::vector<Phase> BuildPhases() {    std::vector<Phase> p = {
         {"settle", 0.8, {0.0, 0.0, 0.0}},
         {"stand", 1.5, {0.0, 0.0, 0.0}},
         {"hold", 1.0, {0.0, 0.0, 0.0}},
@@ -120,20 +148,50 @@ int main(int argc, char** argv) {
     GaitParams gait_params;
     double stance_press = 0.0;  // 支撑相把足端 z 额外下压 [m]（软接触下提高接地可靠性）
     double cmd_scale = 1.0;     // 命令缩放（用于摸「开环稳定速度区间」）
+    bool global_period_set = false;
+    bool global_duty_set = false;
+    bool global_swing_set = false;
 
     // ---- docs/03 §7 那套 M0/M1 工程细节（默认全关，保持当前基线；给了值就按参考实现跑）----
     // 参考值：死区 0.06、命令斜坡 2.5 /s、起步足端混合 1.0 s、关节目标速率限幅 6 rad/s、
     // 步幅限幅 stepX/stepY = 0.10/0.035 m、M1 增益 0.5/0.5/0.5 + 一阶低通 0.05 s + 单脚限幅 0.04 m。
     double deadzone = 0.0;      // S4_DEADZONE
-    double cmd_rate = 0.0;      // S4_RAMP
-    double blend_win = 0.0;     // S4_BLEND
+    // 默认 1.5 /s：二轴混合换向时，若让速度命令直接阶跃，支撑脚目标会在一帧内跳约 4 cm，
+    // 关节力矩瞬间打满并失稳；1.5 /s 下 0.5 m/s 约 0.33 s 到位，稳态分析仍跳过前 2 s。
+    double cmd_rate = 1.5;      // S4_RAMP
+    double blend_win = 0.8;     // S4_BLEND
     double jv_rate = 0.0;       // S4_JV_RATE
     double step_x = 0.0;        // S4_STEP_X
     double step_y = 0.0;        // S4_STEP_Y
     // 扫掠增益 λ（对应参考实现里"仿真传动效率<1 用 λ 慢积分标定"那一层）：
-    // λ 只放大**送进步态的**命令（=放大规划步幅），phases.csv 仍记原始意图，
-    // 所以分析口径依然是"实际速度 / 原始命令"，不会自我欺骗。
+    // λ 只放大**送进步态的**命令（=放大规划步幅）；
+    // 注意 λ 在包络限幅之前，若 λ>1 又开了包络，实际生效值仍受包络约束。
     double sweep_gain = 1.0;    // S4_SWEEP_GAIN
+    // 偏航角速度反馈：只修正送进步态的 wz，不改变 phases/segments 中记录的原始指令。
+    // S4_WZ_KP=0 时保持纯开环；S4_WZ_TAU 为一阶低通时间常数。
+    double wz_kp = 0.0;         // S4_WZ_KP
+    double wz_tau = 0.05;       // S4_WZ_TAU
+    double wz_corr_max = 0.15;  // S4_WZ_CORR_MAX [rad/s]
+    // 斜向平移的偏航交叉耦合前馈：wz_ff = k * max(vx, 0) * vy（S4_YAW_FF）。
+    // 实测：只有「前进 + 侧移」出现与 vy 反号的偏航漂移；后退斜向和纯侧移不需要补偿，
+    // 因此用 max(vx,0) 限制方向。单轴、xz、yz（vx 或 vy 为 0）自动为 0。
+    double yaw_ff = 0.0;
+    // 标称足位前后偏移 [m]（S4_NOM_X）。官方模型质心在髋中心后方 7.2 mm，而默认站立角的
+    // 标称落足中心在前方 6.1 mm，两者相差 13.3 mm；默认取 -0.0133 把支撑中心移到质心下方。
+    // 实测：该配平把前进+侧移的侧倾从 18.2° 降到 2.4–4.1°。
+    double nom_x = -0.0133;     // S4_NOM_X（0 可回到未配平）
+    // ---- 方案 B：速度包络限幅（docs/00 §9.3）----
+    // 单轴区间 x 0.60 / y 0.35 / z 0.50，并要求 hypot(vx,vy)+0.18|wz| ≤ 0.67。
+    // 依据：三轴同时满量程时，0.50/0.30/0.40 已是开环可用边界；
+    // 超过该归一化上限后，最差支撑步幅 >0.19 m 会出现侧倾（先出现于前进+右移+逆时针）。
+    // 想回到“命令原样执行”的旧行为，设 S4_ENV_LIMIT=0。
+    EnvelopeParams env;
+    if (const char* e = std::getenv("S4_ENV_LIMIT")) env.enabled = std::atoi(e) != 0;
+    if (const char* e = std::getenv("S4_ENV_VX")) env.vx_max = std::atof(e);
+    if (const char* e = std::getenv("S4_ENV_VY")) env.vy_max = std::atof(e);
+    if (const char* e = std::getenv("S4_ENV_WZ")) env.wz_max = std::atof(e);
+    if (const char* e = std::getenv("S4_ENV_S_MAX")) env.s_max = std::atof(e);
+    if (const char* e = std::getenv("S4_ENV_WZ_WEIGHT")) env.wz_weight = std::atof(e);
     bool m1_on = false;         // S4_M1
     double m1_gh = 0.5, m1_gr = 0.5, m1_gp = 0.5;
     // 符号默认按**本工程约定**标定（y 向左、roll>0 = 左侧抬起、pitch>0 = 机头向下）：
@@ -142,9 +200,18 @@ int main(int argc, char** argv) {
     double m1_tau = 0.05, m1_dz = 0.04, m1_sr = 1.0, m1_sp = 1.0;
     if (const char* e = std::getenv("S4_KP")) kp = std::atof(e);
     if (const char* e = std::getenv("S4_KD")) kd = std::atof(e);
-    if (const char* e = std::getenv("S4_SWING_HEIGHT")) gait_params.swing_height = std::atof(e);
-    if (const char* e = std::getenv("S4_DUTY")) gait_params.duty = std::atof(e);
-    if (const char* e = std::getenv("S4_PERIOD")) gait_params.period = std::atof(e);
+    if (const char* e = std::getenv("S4_SWING_HEIGHT")) {
+        gait_params.swing_height = std::atof(e);
+        global_swing_set = true;
+    }
+    if (const char* e = std::getenv("S4_DUTY")) {
+        gait_params.duty = std::atof(e);
+        global_duty_set = true;
+    }
+    if (const char* e = std::getenv("S4_PERIOD")) {
+        gait_params.period = std::atof(e);
+        global_period_set = true;
+    }
     if (const char* e = std::getenv("S4_STANCE_PRESS")) stance_press = std::atof(e);
     if (const char* e = std::getenv("S4_CMD_SCALE")) cmd_scale = std::atof(e);
     if (const char* e = std::getenv("S4_DEADZONE")) deadzone = std::atof(e);
@@ -154,6 +221,11 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("S4_STEP_X")) step_x = std::atof(e);
     if (const char* e = std::getenv("S4_STEP_Y")) step_y = std::atof(e);
     if (const char* e = std::getenv("S4_SWEEP_GAIN")) sweep_gain = std::atof(e);
+    if (const char* e = std::getenv("S4_WZ_KP")) wz_kp = std::atof(e);
+    if (const char* e = std::getenv("S4_WZ_TAU")) wz_tau = std::atof(e);
+    if (const char* e = std::getenv("S4_WZ_CORR_MAX")) wz_corr_max = std::atof(e);
+    if (const char* e = std::getenv("S4_NOM_X")) nom_x = std::atof(e);
+    if (const char* e = std::getenv("S4_YAW_FF")) yaw_ff = std::atof(e);
     if (const char* e = std::getenv("S4_M1")) m1_on = std::atoi(e) != 0;
     if (const char* e = std::getenv("S4_M1_GAIN_H")) m1_gh = std::atof(e);
     if (const char* e = std::getenv("S4_M1_GAIN_ROLL")) m1_gr = std::atof(e);
@@ -162,6 +234,77 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("S4_M1_DZ_LIM")) m1_dz = std::atof(e);
     if (const char* e = std::getenv("S4_M1_SIGN_ROLL")) m1_sr = std::atof(e);
     if (const char* e = std::getenv("S4_M1_SIGN_PITCH")) m1_sp = std::atof(e);
+
+    // ---- 三段式步态参数（docs/00）：每段独立整定 T/d/H ----
+    // 默认取设计区间中值；S4_PERIOD/DUTY/SWING_HEIGHT 仍作为全局覆盖（同时作用于三段），
+    // S4_LOW_*/S4_MID_*/S4_HIGH_* 用于单段覆盖。
+    SegmentedGaitParams gait_schedule;
+    gait_schedule.low = gait_schedule.mid = gait_schedule.high = gait_params;
+    // 2026-10-18 六方向单轴扫描最优值（x 正/反、y 左/右、z 顺/逆）：
+    // 低速 0.75/0.72/0.09（1.33 Hz）、中速 0.63/0.70/0.09（1.59 Hz）、
+    // 高速 0.45/0.625/0.07（2.22 Hz）。
+    // 高速 T=0.48/0.50 在六方向场景会失稳，T=0.45 是满足 0.05 指标的较慢安全值。
+    gait_schedule.low.period = 0.75;
+    gait_schedule.low.duty = 0.72;
+    gait_schedule.low.swing_height = 0.09;
+    gait_schedule.mid.period = 0.63;
+    gait_schedule.mid.duty = 0.70;
+    gait_schedule.mid.swing_height = 0.09;
+    gait_schedule.high.period = 0.44;
+    gait_schedule.high.duty = 0.625;
+    gait_schedule.high.swing_height = 0.07;
+    if (global_period_set) {
+        gait_schedule.low.period = gait_schedule.mid.period = gait_schedule.high.period = gait_params.period;
+    }
+    if (global_duty_set) {
+        gait_schedule.low.duty = gait_schedule.mid.duty = gait_schedule.high.duty = gait_params.duty;
+    }
+    if (global_swing_set) {
+        gait_schedule.low.swing_height = gait_schedule.mid.swing_height =
+            gait_schedule.high.swing_height = gait_params.swing_height;
+    }
+
+    auto env_set_d = [](const char* name, double* dst) {
+        if (const char* e = std::getenv(name)) *dst = std::atof(e);
+    };
+    env_set_d("S4_SEG_MAX_VX", &gait_schedule.max_vx);
+    env_set_d("S4_SEG_MAX_VY", &gait_schedule.max_vy);
+    env_set_d("S4_SEG_MAX_WZ", &gait_schedule.max_wz);
+    env_set_d("S4_SEG_VX1", &gait_schedule.vx_low_mid);
+    env_set_d("S4_SEG_VX2", &gait_schedule.vx_mid_high);
+    env_set_d("S4_SEG_VY1", &gait_schedule.vy_low_mid);
+    env_set_d("S4_SEG_VY2", &gait_schedule.vy_mid_high);
+    env_set_d("S4_SEG_WZ1", &gait_schedule.wz_low_mid);
+    env_set_d("S4_SEG_WZ2", &gait_schedule.wz_mid_high);
+    env_set_d("S4_SEG_BLEND_VX", &gait_schedule.blend_vx);
+    env_set_d("S4_SEG_BLEND_VY", &gait_schedule.blend_vy);
+    env_set_d("S4_SEG_BLEND_WZ", &gait_schedule.blend_wz);
+    env_set_d("S4_LOW_PERIOD", &gait_schedule.low.period);
+    env_set_d("S4_LOW_DUTY", &gait_schedule.low.duty);
+    env_set_d("S4_LOW_SWING_HEIGHT", &gait_schedule.low.swing_height);
+    env_set_d("S4_MID_PERIOD", &gait_schedule.mid.period);
+    env_set_d("S4_MID_DUTY", &gait_schedule.mid.duty);
+    env_set_d("S4_MID_SWING_HEIGHT", &gait_schedule.mid.swing_height);
+    env_set_d("S4_HIGH_PERIOD", &gait_schedule.high.period);
+    env_set_d("S4_HIGH_DUTY", &gait_schedule.high.duty);
+    env_set_d("S4_HIGH_SWING_HEIGHT", &gait_schedule.high.swing_height);
+    for (GaitParams* p : {&gait_schedule.low, &gait_schedule.mid, &gait_schedule.high}) {
+        p->max_vx = gait_schedule.max_vx;
+        p->max_vy = gait_schedule.max_vy;
+        p->max_wz = gait_schedule.max_wz;
+    }
+    gait_params.max_vx = gait_schedule.max_vx;
+    gait_params.max_vy = gait_schedule.max_vy;
+    gait_params.max_wz = gait_schedule.max_wz;
+    std::printf("[s4] segments: low T=%.3f d=%.3f H=%.3f | mid T=%.3f d=%.3f H=%.3f | "
+                "high T=%.3f d=%.3f H=%.3f\n",
+                gait_schedule.low.period, gait_schedule.low.duty, gait_schedule.low.swing_height,
+                gait_schedule.mid.period, gait_schedule.mid.duty, gait_schedule.mid.swing_height,
+                gait_schedule.high.period, gait_schedule.high.duty, gait_schedule.high.swing_height);
+    std::printf("[s4] envelope %s: |vx|<=%.2f |vy|<=%.2f |wz|<=%.2f, hypot(vx,vy)+%.2f|wz|<=%.2f\n",
+                env.enabled ? "on" : "off", env.vx_max, env.vy_max, env.wz_max, env.wz_weight,
+                env.s_max);
+
     // 起始方式：standing（默认）= 仿真从站立平衡位开始，本程序从第一帧就保持站立构型；
     // drop = 旧的「零力矩落地 + 关节空间起立斜坡」，需配合 SIM_INIT_POSE=drop 使用。
     const bool start_standing =
@@ -181,7 +324,11 @@ int main(int argc, char** argv) {
     }
 
     Lite3Model model;
-    GaitTrajectory gait(gait_params);
+    GaitTrajectory gait(gait_params, &gait_schedule);
+    if (nom_x != 0.0) {
+        gait.ShiftNominal(Vec3d(nom_x, 0.0, 0.0));
+        std::printf("[s4] nominal feet shifted by x=%+.4f m (S4_NOM_X)\n", nom_x);
+    }
     const Vec12d stand = Lite3Model::DefaultStandJointAngles();
 
     std::vector<Phase> phases = BuildPhases();
@@ -213,7 +360,15 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 12; ++i) tcsv << ",cmd" << i;
         tcsv << "\n";
     }
+    std::ofstream scsv;
+    const char* seg_log_path = std::getenv("S4_SEG_LOG");
+    if (seg_log_path != nullptr) {
+        scsv.open(seg_log_path);
+        scsv << "t,rel,phase_idx,phase,seg,period,duty,swing_height,vx,vy,wz\n";
+    }
     long long iter = 0;
+    int last_seg_log = -1;
+    size_t last_seg_phase_log = static_cast<size_t>(-1);
 
     Vec12d q_start = stand;      // settle 结束时的关节角
     Vec12d q_des = stand;
@@ -225,24 +380,54 @@ int main(int argc, char** argv) {
     int status = 0;
 
     double last_t = -1.0;
+    auto last_obs_wall = std::chrono::steady_clock::now();
     double last_rel = 0.0;                     // 上一周期的 rel（算实际 dt，给斜坡/速率限幅用）
     double last_rel_jv = 0.0;
     const Vec12d nominal_feet = gait.nominal_feet();
     GaitCommand cmd_filt;                      // S4_RAMP 的滤波状态
+    double wz_meas_lp = 0.0;                   // S4_WZ_KP 的 yaw rate 低通状态
+    bool wz_lp_init = false;
     bool gait_was_stepping = false;            // 步态起步沿检测（起步混合 / M1 期望高度）
     double t_gait_start = 0.0;
     Eigen::Matrix<double, 3, kNumLegs> feet_at_start;
     double h_des = 0.0;
     Vec3d rpy_lp = Vec3d::Zero();              // M1 一阶低通状态
     bool lp_init = false;
+
+    // 场景命令 -> 实际执行目标：死区 -> 扫掠增益 -> 包络限幅（方案 B）。
+    // phases.csv 记录的是这里的结果，因此分析器拿到的就是“真正下发的目标”。
+    auto target_cmd = [&](const GaitCommand& raw) {
+        GaitCommand c = raw;
+        if (deadzone > 0.0) {
+            if (std::fabs(c.vx) <= deadzone) c.vx = 0.0;
+            if (std::fabs(c.vy) <= deadzone) c.vy = 0.0;
+            if (std::fabs(c.wz) <= deadzone) c.wz = 0.0;
+        }
+        if (sweep_gain != 1.0) {
+            c.vx *= sweep_gain;
+            c.vy *= sweep_gain;
+            c.wz *= sweep_gain;
+        }
+        return LimitEnvelope(c, env);
+    };
     while (true) {
         next_tick += period;
         std::this_thread::sleep_until(next_tick);
 
         const double t = ri->GetInterfaceTimeStamp();
         // 每个新时间戳只更新一次目标；仿真和命令发送各自按墙钟运行。
-        if (t <= last_t) continue;
+        // 仿真进程退出后不再有新时间戳，控制器应在 1 s 内退出，而不是无限等待。
+        if (t <= last_t) {
+            if (std::chrono::steady_clock::now() - last_obs_wall > std::chrono::seconds(1)) {
+                std::fprintf(stderr, "[s4] simulation stalled at t=%.2f (no new data for 1 s)\n",
+                             last_t);
+                status = 5;
+                break;
+            }
+            continue;
+        }
         last_t = t;
+        last_obs_wall = std::chrono::steady_clock::now();
         const double rel = t - t0;
         if (rel >= total_duration) break;
 
@@ -258,17 +443,20 @@ int main(int argc, char** argv) {
 
         if (idx != cur_idx) {
             cur_idx = idx;
+            wz_lp_init = false;  // 新相位从当前实测 yaw rate 重新起滤波
+            const GaitCommand applied = target_cmd(phases[idx].cmd);
             pcsv << phases[idx].name << "," << (t0 + acc) << "," << (t0 + acc + phases[idx].duration)
-                 << "," << phases[idx].cmd.vx << "," << phases[idx].cmd.vy << "," << phases[idx].cmd.wz
-                 << "\n";
+                 << "," << applied.vx << "," << applied.vy << "," << applied.wz << "\n";
             pcsv.flush();
-            std::printf("[s4] t=%.2f enter phase '%s' (%.1fs) cmd=(%.2f,%.2f,%.2f)\n", rel,
-                        phases[idx].name.c_str(), phases[idx].duration, phases[idx].cmd.vx,
-                        phases[idx].cmd.vy, phases[idx].cmd.wz);
+            std::printf("[s4] t=%.2f enter phase '%s' (%.1fs) cmd=(%.2f,%.2f,%.2f)"
+                        " -> applied=(%.2f,%.2f,%.2f)\n",
+                        rel, phases[idx].name.c_str(), phases[idx].duration, phases[idx].cmd.vx,
+                        phases[idx].cmd.vy, phases[idx].cmd.wz, applied.vx, applied.vy, applied.wz);
         }
 
         const Vec12d q_meas = ri->GetJointPosition().cast<double>();
         const Vec12d dq_meas = ri->GetJointVelocity().cast<double>();
+        const Vec3d omega_meas = ri->GetImuOmega().cast<double>();
         (void)dq_meas;
 
         double eff_kp = kp, eff_kd = kd;
@@ -293,22 +481,13 @@ int main(int argc, char** argv) {
                 q_des = (1.0 - s) * q_start + s * stand;
             }
         } else {
-            // ---- 命令预处理（docs/03 §7.1/§7.2：死区 -> 步幅限幅 -> 斜坡滤波）----
+            // ---- 命令预处理（docs/03 §7.1/§7.2：死区 -> 扫掠增益 -> 包络限幅 -> 步幅限幅 -> 斜坡滤波）----
             const double dt_ctrl = std::max(1e-6, rel - last_rel);
             last_rel = rel;
-            GaitCommand cmd = phases[idx].cmd;
-            if (deadzone > 0.0) {
-                if (std::fabs(cmd.vx) <= deadzone) cmd.vx = 0.0;
-                if (std::fabs(cmd.vy) <= deadzone) cmd.vy = 0.0;
-                if (std::fabs(cmd.wz) <= deadzone) cmd.wz = 0.0;
-            }
-            if (sweep_gain != 1.0) {
-                cmd.vx *= sweep_gain;
-                cmd.vy *= sweep_gain;
-                cmd.wz *= sweep_gain;
-            }
+            GaitCommand cmd = target_cmd(phases[idx].cmd);
+            const GaitParams active = gait_schedule.Select(cmd);
             if (step_x > 0.0 || step_y > 0.0)
-                cmd = LimitStep(cmd, gait_params.period * gait_params.duty, nominal_feet, step_x, step_y);
+                cmd = LimitStep(cmd, active.period * active.duty, nominal_feet, step_x, step_y);
             if (cmd_rate > 0.0) {
                 const double md = cmd_rate * dt_ctrl;
                 cmd_filt.vx = Approach(cmd_filt.vx, cmd.vx, md);
@@ -317,9 +496,39 @@ int main(int argc, char** argv) {
                 cmd = cmd_filt;
             }
 
+            // 偏航角速度反馈：目标 wz 与实际 IMU yaw rate 的误差按比例加到送进步态的 wz。
+            // 只影响足端轨迹，不改写 cmd，因此 phases/segments 仍是“原始指令”。
+            GaitCommand gait_cmd = cmd;
+            if (yaw_ff != 0.0) gait_cmd.wz += yaw_ff * std::max(cmd.vx, 0.0) * cmd.vy;
+            if (wz_kp > 0.0 && std::fabs(cmd.wz) < 0.05) {
+                if (!wz_lp_init) {
+                    wz_meas_lp = omega_meas.z();
+                    wz_lp_init = true;
+                }
+                const double a = dt_ctrl / (std::max(1e-6, wz_tau) + dt_ctrl);
+                wz_meas_lp += a * (omega_meas.z() - wz_meas_lp);
+                const double corr = wz_kp * (cmd.wz - wz_meas_lp);
+                gait_cmd.wz += std::clamp(corr, -wz_corr_max, wz_corr_max);
+            }
+
             // 步态 + 起步足端混合（1 s smoothstep：从进入步态时的实测脚位混到规划轨迹）+ M1
-            auto legs = gait.Update(rel, cmd);
+            auto legs = gait.Update(rel, gait_cmd);
             const bool stepping = gait.stepping();
+            const int seg = gait_schedule.SelectIndex(cmd);
+            if (seg != last_seg_log || idx != last_seg_phase_log) {
+                const GaitParams& gp = gait.params();
+                if (scsv.is_open()) {
+                    scsv << std::setprecision(10) << t << "," << rel << "," << idx << ","
+                         << phases[idx].name << "," << seg << "," << gp.period << "," << gp.duty
+                         << "," << gp.swing_height << "," << cmd.vx << "," << cmd.vy << ","
+                         << cmd.wz << "\n";
+                    scsv.flush();
+                }
+                std::printf("[s4] seg=%d T=%.3f d=%.3f H=%.3f cmd=(%.3f,%.3f,%.3f)\n", seg,
+                            gp.period, gp.duty, gp.swing_height, cmd.vx, cmd.vy, cmd.wz);
+                last_seg_log = seg;
+                last_seg_phase_log = idx;
+            }
             if (stepping && !gait_was_stepping) {
                 t_gait_start = rel;
                 feet_at_start = model.FootPositionsBody(q_meas);

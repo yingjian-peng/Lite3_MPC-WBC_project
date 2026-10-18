@@ -164,6 +164,56 @@ int main() {
         Check(ok, "swing curve boundary properties");
     }
 
+    // ---- 8) 三段式参数选择与切换时相位连续 ----
+    {
+        SegmentedGaitParams schedule;
+        schedule.low = p;
+        schedule.low.period = 0.65;
+        schedule.low.duty = 0.70;
+        schedule.low.swing_height = 0.09;
+        schedule.mid = p;
+        schedule.mid.period = 0.50;
+        schedule.mid.duty = 0.66;
+        schedule.mid.swing_height = 0.08;
+        schedule.high = p;
+        schedule.high.period = 0.375;
+        schedule.high.duty = 0.625;
+        schedule.high.swing_height = 0.07;
+        schedule.max_vx = 0.50;
+        schedule.max_vy = 0.30;
+        schedule.max_wz = 0.40;
+        for (GaitParams* sp : {&schedule.low, &schedule.mid, &schedule.high}) {
+            sp->max_vx = schedule.max_vx;
+            sp->max_vy = schedule.max_vy;
+            sp->max_wz = schedule.max_wz;
+        }
+
+        const auto lo = schedule.Select(GaitCommand{0.15, 0.0, 0.0});
+        const auto mi = schedule.Select(GaitCommand{0.275, 0.0, 0.0});
+        const auto hi = schedule.Select(GaitCommand{0.425, 0.0, 0.0});
+        Check(std::fabs(lo.period - 0.65) < 1e-12 &&
+                  std::fabs(mi.period - 0.50) < 1e-12 &&
+                  std::fabs(hi.period - 0.375) < 1e-12,
+              "segmented params select T by speed");
+        Check(schedule.SelectIndex(GaitCommand{0.15, 0.0, 0.0}) == 0 &&
+                  schedule.SelectIndex(GaitCommand{0.275, 0.0, 0.0}) == 1 &&
+                  schedule.SelectIndex(GaitCommand{0.425, 0.0, 0.0}) == 2,
+              "segmented index by speed");
+
+        GaitTrajectory seg_gait(p, &schedule);
+        seg_gait.Reset(0.0);
+        seg_gait.Update(0.0, GaitCommand{0.15, 0.0, 0.0});
+        const double t_switch = 1.30;
+        seg_gait.Update(t_switch, GaitCommand{0.15, 0.0, 0.0});
+        const double phase_before = seg_gait.GlobalPhase(t_switch);
+        seg_gait.Update(t_switch, GaitCommand{0.425, 0.0, 0.0});
+        const double phase_after = seg_gait.GlobalPhase(t_switch);
+        Check(std::fabs(phase_before - phase_after) < 1e-9,
+              "phase continuous when switching T");
+        Check(std::fabs(seg_gait.params().period - 0.375) < 1e-12,
+              "high segment params active after switch");
+    }
+
     std::printf("RESULT: %s\n", g_failures == 0 ? "PASS" : "FAIL");
     return g_failures == 0 ? 0 : 1;
 }
