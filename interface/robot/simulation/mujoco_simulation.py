@@ -90,6 +90,21 @@ class MuJoCoSimulation:
             print(f"[sim] 接触模型：只保留足端球（已关闭 {len(disabled)} 个小腿碰撞 geom；"
                   f"SIM_LEG_COLLISION=full 可恢复）")
 
+        # 坡面：SIM_SLOPE_DEG 把地面绕世界 y 轴倾斜（正值 = +x 方向下坡）。
+        # 默认 0 即平地，不影响既有结果。用于评估开环基线的坡度鲁棒性。
+        self.slope_deg = float(os.environ.get("SIM_SLOPE_DEG", "0") or 0.0)
+        if self.slope_deg != 0.0:
+            half = 0.5 * np.radians(self.slope_deg)
+            quat = np.array([np.cos(half), 0.0, np.sin(half), 0.0])
+            tilted = []
+            for i in range(self.model.ngeom):
+                if self.model.geom_type[i] != mujoco.mjtGeom.mjGEOM_PLANE:
+                    continue
+                self.model.geom_quat[i] = quat
+                name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i) or f"geom{i}"
+                tilted.append(name)
+            print(f"[sim] 坡面：地面绕 y 轴倾斜 {self.slope_deg:+.2f}°（正=+x 下坡），geom={tilted}")
+
         self.data = mujoco.MjData(self.model)
 
         # Robot DOF list
@@ -111,6 +126,21 @@ class MuJoCoSimulation:
         self.qpos_hold = self.data.qpos[7:7+self.dof_num].copy().reshape(-1, 1)
         self.hold_kp = float(os.environ.get("SIM_HOLD_KP", "200"))
         self.hold_kd = float(os.environ.get("SIM_HOLD_KD", "5"))
+
+        # 外力扰动：SIM_PUSH_FX/FY [N]、SIM_PUSH_T0 [s]、SIM_PUSH_DUR [s]，
+        # 作用在机身（TORSO）质心上，用于评估推力扰动的恢复能力。默认全 0 = 关闭。
+        self.push_fx = float(os.environ.get("SIM_PUSH_FX", "0") or 0.0)
+        self.push_fy = float(os.environ.get("SIM_PUSH_FY", "0") or 0.0)
+        self.push_t0 = float(os.environ.get("SIM_PUSH_T0", "0") or 0.0)
+        self.push_dur = float(os.environ.get("SIM_PUSH_DUR", "0") or 0.0)
+        self.push_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "TORSO")
+        if self.push_body < 0:
+            self.push_body = 1  # 兜底：世界体是 0，机器人基座是 1
+        if self.push_dur > 0.0:
+            print(f"[sim] 推力扰动：({self.push_fx:+.1f}, {self.push_fy:+.1f}) N，"
+                  f"t={self.push_t0:.2f}–{self.push_t0 + self.push_dur:.2f} s，"
+                  f"impulse=({self.push_fx * self.push_dur:+.2f}, "
+                  f"{self.push_fy * self.push_dur:+.2f}) N·s")
 
         # IMU
         self.last_base_linvel = np.zeros((3, 1), np.float64)
@@ -315,6 +345,12 @@ class MuJoCoSimulation:
 
                 step += 1
                 # 控制律
+
+                # 外力扰动窗口（默认关闭）
+                if self.push_dur > 0.0:
+                    active = self.push_t0 <= self.timestamp < self.push_t0 + self.push_dur
+                    self.data.xfrc_applied[self.push_body, 0] = self.push_fx if active else 0.0
+                    self.data.xfrc_applied[self.push_body, 1] = self.push_fy if active else 0.0
 
                 self._apply_joint_torque()
                 # 模拟一步

@@ -154,6 +154,32 @@ CTest 检查模型对表、步态、估计、QP 和控制器离线行为。它�
 
     python3 mpc_wbc/test/energy_metrics.py <sim.csv> <phases.csv> --label T0.44 --json o.json
 
+## 鲁棒性测试
+
+开环基线的裕度用 `run_robustness.sh` 一键跑（无头，约 10 分钟）：
+
+    bash mpc_wbc/test/run_robustness.sh build/robust
+
+覆盖四类扰动，全部通过 `sweep_gait_params.py --sim-env` 注入仿真侧参数，不改代码：
+
+| 场景 | 做法 | 场景文件 |
+| --- | --- | --- |
+| 侧向推力 | `SIM_PUSH_FY=±30/45`、`SIM_PUSH_T0=8`、`SIM_PUSH_DUR=0.15`（作用在 TORSO） | `robust_push.csv` |
+| 坡面 | `SIM_SLOPE_DEG=2`（地面绕 y 轴倾斜，正值为 +x 下坡） | `robust_slope.csv` |
+| 速度阶跃 | 0.20 ↔ 0.50 m/s 每 3 s 切换，共 10 段 | `robust_step.csv` |
+| 连续运行 | ±0.30 m/s 各 30 s 交替 5 个来回，共 300 s | `robust_drift.csv` |
+
+推力扰动的恢复过程用 `analyze_push.py` 量化（峰值倾角 / 恢复到基线+1° 的时间 / 残余航向偏转）：
+
+    python3 mpc_wbc/test/analyze_push.py build/robust/push_y*/**
+
+`--sim-env` 也可以单独用，例如临时给一个坡面做单点验证：
+
+    python3 mpc_wbc/test/sweep_gait_params.py --segment mid \
+      --scenario mpc_wbc/test/scenarios/robust_slope.csv \
+      --configs 0.75:0.70:0.07 --duration 50 --settle 3.0 --seg-log \
+      --outdir build/x --sim-env SIM_SLOPE_DEG=2
+
 ## 后续优化器路径
 
 优化器源码和 mpc_wbc_mpc_wbc_sim、state_machine/mpc_control_state.hpp 仍可构建。进入这些路径前，先完成 [R0–R3 开环验收](../docs/04_Lite3_MPC_WBC实现步骤与里程碑.md)；随后逐项打开高度/姿态反馈、状态估计、力前馈、MPC 和 WBC。每次只改变一个控制层，保留可回退的上一步配置，分别验证数学残差与真实足端/机身运动。

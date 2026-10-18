@@ -1,0 +1,9 @@
+phase,duration,vx,vy,wz
+hold_a,1.5,0,0,0
+hold_b,1.3,0,0,0
+up_slow,12.0,0.15,0,0
+stop_a,2.0,0,0,0
+up_mid,12.0,0.30,0,0
+stop_b,2.0,0,0,0
+down_mid,12.0,-0.30,0,0
+stop_c,2.0,0,0,0

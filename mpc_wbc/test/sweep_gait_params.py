@@ -73,6 +73,11 @@ def run_one(cfg, args, tag):
         SIM_LOG_EVERY="10",
         SIM_INIT_POSE="stand",
     )
+    for kv in args.sim_env:
+        if "=" not in kv:
+            raise SystemExit(f"bad --sim-env '{kv}', expect K=V")
+        k, v = kv.split("=", 1)
+        sim_env[k.strip()] = v.strip()
     python = args.python
     sim = subprocess.Popen(
         [python, SIM_SCRIPT],
@@ -233,6 +238,12 @@ def main():
         action="store_true",
         help="混合速度场景：按 segments.csv 的逐相位周期分析",
     )
+    ap.add_argument(
+        "--sim-env",
+        action="append",
+        default=[],
+        help="额外注入给仿真的环境变量 K=V（可重复），如 SIM_SLOPE_DEG=2"
+    )
     args = ap.parse_args()
 
     if args.vmax is None:
@@ -247,6 +258,10 @@ def main():
         if args.env:
             tag += "_" + "_".join(
                 kv.replace("=", "") for kv in args.env
+            )
+        if args.sim_env:
+            tag += "_" + "_".join(
+                kv.replace("=", "") for kv in args.sim_env
             )
         print(f"\n=== [{i + 1}/{len(configs)}] {args.segment} {tag} ===", flush=True)
         row = run_one(cfg, args, tag)
