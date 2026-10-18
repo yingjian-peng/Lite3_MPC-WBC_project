@@ -85,6 +85,8 @@ CTest 检查模型对表、步态、估计、QP 和控制器离线行为。它�
 
 方案 B + 保真度与配平后的实测（`build/final44_single/`、`build/final44_mix3/`、`build/final44_mix2_r2/`）：单轴高速 6/6 OK（最差偏航 0.038）；三轴 4/4 OK（最大侧倾 3.7°）；二轴 9/12 OK，最大侧倾 4.1°，残余为前进斜向 0.06–0.08 rad/s 偏航漂移与一段 0.051 m/s 跟踪误差。稳定性拐点在 $s_{max}\approx0.85$–$0.93$。
 
+分段参数重扫（低速 1.20、中速 1.05，见下节）后的回归：`build/final6/{low,mid,high}` 三组单轴各 6/6 OK；`build/final6/mix3` 三轴 4/4 OK；`build/final8/mixed`（`segments_3x3_20s`，跨三个速度段 9 段）9/9 OK，最大侧倾 3.7°；`build/final6/mix2*`、`build/final7/mix2_wideblend` 二轴 7/12（三次一致，比冻结基线少 1 项，多出的一项落在 0.050–0.056 阈值边缘）。
+
 先看站姿、关节跟踪和真实力矩，再看单腿净空、支撑滑移、三轴速度及停步。至少多次重复同一场景，保存原始 CSV、配置和代码版本。旧版锁步结果在 [历史记录](../docs/archive/04_旧版实现与试验记录.md) 中保留供追溯，但不能作为新时序的对照基线。
 
 ## 三段式开环调参
@@ -93,19 +95,28 @@ CTest 检查模型对表、步态、估计、QP 和控制器离线行为。它�
 
 | 段 | T (s) | d | H (m) | 步频 | 来源 |
 | --- | --- | --- | --- | --- | --- |
-| 低 | 0.75 | 0.72 | 0.09 | 1.33 Hz | 六方向单轴扫描 |
-| 中 | 0.63 | 0.70 | 0.09 | 1.59 Hz | 六方向单轴扫描 |
-| 高 | 0.44 | 0.625 | 0.07 | 2.27 Hz | 六方向单轴扫描 + 保真度/配平后重整定 |
+| 低 | **1.20** | 0.72 | 0.07 | **0.83 Hz** | 速度区间更新后重扫（降步频） |
+| 中 | **1.05** | 0.70 | 0.07 | **0.95 Hz** | 速度区间更新后重扫（降步频） |
+| 高 | 0.44 | 0.625 | 0.07 | 2.27 Hz | 三轴偏航波动锁定，不能再降 |
 
-2026-10-18 把步态周期整体放慢，允许更大步幅，以降低摆动频率和功耗；上一轮为 0.60 / 0.55 / 0.35。该组参数已在 3×3×20 s 场景复测，9 段全部稳定完成，结果记录在 ../docs/05_优化日志.md。
+2026-10-18 晚按“降步频、增步幅、降功耗”重扫：低/中速段步频分别降到 0.83 / 0.95 Hz（−38% / −40%），步幅增到 0.173 / 0.257 m（+60% / +67%），关节机械功率降到 9.1 / 16.1 W（−60% / −54%）；高速段受三轴组合的偏航波动限制，保持 0.44/0.625。
+
+- 中/低速段再往上探仍稳定（中速 T=1.25 即 0.80 Hz、步幅 0.306 m 仍 OK），只是侧倾与滑移缓慢上升，取 1.05 为代价最小的一档；
+- 高速段 T≥0.46 就会让 `verify_mix3` 掉项，且在相同步幅下降低占空比（0.46/0.63、0.50/0.58）同样失稳；
+- 判定与功耗数据见 [优化日志](../docs/05_优化日志.md) 的“分段步态参数重扫”一节。
 
 可用环境变量单段覆盖：
 
-    S4_LOW_PERIOD=0.75 S4_LOW_DUTY=0.72 S4_LOW_SWING_HEIGHT=0.09
-    S4_MID_PERIOD=0.63 S4_MID_DUTY=0.70 S4_MID_SWING_HEIGHT=0.09
+    S4_LOW_PERIOD=1.20 S4_LOW_DUTY=0.72 S4_LOW_SWING_HEIGHT=0.07
+    S4_MID_PERIOD=1.05 S4_MID_DUTY=0.70 S4_MID_SWING_HEIGHT=0.07
     S4_HIGH_PERIOD=0.44 S4_HIGH_DUTY=0.625 S4_HIGH_SWING_HEIGHT=0.07
 
-段边界可用 `S4_SEG_VX1/VX2`、`S4_SEG_VY1/VY2`、`S4_SEG_WZ1/WZ2` 覆盖，边界插值带宽用 `S4_SEG_BLEND_VX/VY/WZ`；`S4_SEG_MAX_VX/VY/WZ` 只影响主运动方向归一化。`S4_SEG_LOG=<csv>` 记录每次选段时的 T/d/H，便于核对。
+段边界可用 `S4_SEG_VX1/VX2`、`S4_SEG_VY1/VY2`、`S4_SEG_WZ1/WZ2` 覆盖，边界插值带宽用 `S4_SEG_BLEND_VX/VY/WZ`（默认 **0.10 / 0.075 / 0.10**，加宽是为了让减速穿段时周期不在一帧内跳变）；`S4_SEG_MAX_VX/VY/WZ` 只影响主运动方向归一化。`S4_SEG_LOG=<csv>` 记录选段与参数变化，便于核对（周期在带宽内连续变化时也会记行）。
+
+长周期带来的两个瞬态问题已在代码里处理：
+
+- **软停步**（`GaitTrajectory::Update`）：命令归零后不立即退出步态，等相位回到 θ<0.01（四足同时支撑、足端正好在标称位）再退出，避免目标位跳变；
+- **独立减速斜坡** `S4_RAMP_DECEL`（默认 0.75 /s，加速仍 1.5 /s）：单轴高速场景停步倾角从 9.1° 降到 3.6°。
 
 开环调参不追求起步/切换瞬态，只看稳态：`analyze_s4_steady.py` 会跳过每个运动相位开头的 `settle` 时间，用「一个步态周期的滑动平均」计算速度误差和低频波动。逐段搜索可运行：
 
@@ -123,6 +134,27 @@ CTest 检查模型对表、步态、估计、QP 和控制器离线行为。它�
       --candidates "T=0.60,0.63,0.65;d=0.66,0.68,0.70;H=0.08,0.09,0.10"
 
 产物在 `build/tune_s4/`：每个候选的原始 CSV、`results.csv` 和 `best.json`。搜索默认以稳态速度误差、周期平均速度峰峰值为主要代价，姿态、力矩饱和和足端滑移作为惩罚项；如果候选跌倒则直接淘汰。`--nominal` 可覆盖搜索起点。`--freq-weight`（默认 0.03）给步频加惩罚 `weight/T`，用于在跟踪误差接近时优先选择更慢、更省电的步态；设为 0 则只看稳态误差。
+
+单段扫参推荐用 `sweep_gait_params.py`：它自己起停仿真、跑控制器再调分析器，一次给出整张对比表（`T/d/H/步频/步幅/结果/cost/侧倾/误差/滑移`），并写出 `sweep_summary.json`。
+
+    # 高速段三档对比
+    python3 mpc_wbc/test/sweep_gait_params.py --segment high \
+      --scenario mpc_wbc/test/scenarios/verify_single_high.csv \
+      --configs 0.44:0.625:0.07,0.52:0.68:0.07,0.62:0.68:0.07 \
+      --duration 68 --outdir build/sweep_high
+
+    # 跨速度段场景：按 segments.csv 逐相位取周期
+    python3 mpc_wbc/test/sweep_gait_params.py --segment high \
+      --scenario mpc_wbc/test/scenarios/segments_3x3_20s.csv \
+      --configs 0.44:0.625:0.07 --duration 197 --settle 3.0 --seg-log \
+      --outdir build/final8/mixed
+
+    # 顺手加一个控制器环境变量做 A/B（可重复 --env）
+    ... --env S4_NOM_X=-0.008 --env S4_RAMP_DECEL=1.5
+
+功耗用 `energy_metrics.py` 从 `sim.csv` 的 `qd`/`atau` 估算：`P_abs` 为关节绝对机械功率（升降都算消耗），`P_cu` 为 $\sum\tau^2$ 铜损代理（真实电机损耗的主项，由承重决定，基本与步频无关）。
+
+    python3 mpc_wbc/test/energy_metrics.py <sim.csv> <phases.csv> --label T0.44 --json o.json
 
 ## 后续优化器路径
 
