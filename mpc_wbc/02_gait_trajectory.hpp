@@ -79,9 +79,14 @@ struct SegmentedGaitParams {
     double wz_mid_high = 0.30;  // rad/s
 
     // 边界插值带宽（物理单位）；0 表示直接切换。
-    double blend_vx = 0.02;   // m/s
-    double blend_vy = 0.015;  // m/s
-    double blend_wz = 0.02;   // rad/s
+    // 带宽从 0.02/0.015/0.02 放宽到 0.10/0.075/0.10：减速时命令会从高速段一路穿过
+    // 中速段落到低速段，周期 0.44 → 1.05 → 1.20 逐级拉长；窄带宽下这是一步内的
+    // 跳变（v=0.35 m/s 时足端行程 dp=v·T·d 从 0.096 直接翻到 0.179 m），实测三轴
+    // 急停倾角冲击 13°。放宽后同一个过渡分散到 0.10 m/s 的命令区间，倾角降到 5.2°，
+    // 稳态选段不受影响（验收工况的主轴分量都在纯段区间内）。
+    double blend_vx = 0.10;   // m/s
+    double blend_vy = 0.075;  // m/s
+    double blend_wz = 0.10;   // rad/s
 
     static double SmoothStep01(double x) {
         x = std::max(0.0, std::min(1.0, x));
@@ -245,7 +250,12 @@ public:
                 t_start_ = t;  // θ=0 时四足均处于支撑相，可从静立平稳起走
             }
         } else if (ns < params_.stop_threshold) {
-            stepping_ = false;
+            // 软停步：命令已归零，但不立即退出步态。若中途退出，足端目标会从
+            // 当前相位位置瞬间拉回标称位（低速段步幅可达 0.17 m，实测倾角冲击
+            // 13°）。等相位刚过 θ=0 时四足同时处于支撑相且足端正好在标称位，
+            // 此时退出没有任何位置跳变。代价是多走完当前一步（≤1 个周期）。
+            const double theta = Wrap01((t - t_start_) / params_.period);
+            if (theta < 0.01) stepping_ = false;
         }
         return Evaluate(t, cmd);
     }

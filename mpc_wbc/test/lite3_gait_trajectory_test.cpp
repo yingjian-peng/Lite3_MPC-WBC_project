@@ -46,16 +46,33 @@ int main() {
         Check(!gait.stepping() && all_contact && all_at_nominal, "zero-command stand");
     }
 
-    // ---- 2) 起步/停步滞回 ----
+    // ---- 2) 起步/停步滞回（软停步：命令归零后走完当前周期再退出）----
     {
         gait.Reset(10.0);
         gait.Update(10.0, GaitCommand{0.0, 0.0, 0.0});
         const bool stopped = !gait.stepping();
         gait.Update(10.0, GaitCommand{0.2, 0.0, 0.0});
         const bool started = gait.stepping();
-        gait.Update(10.5, GaitCommand{0.0, 0.0, 0.0});
-        const bool stopped_again = !gait.stepping();
-        Check(stopped && started && stopped_again, "start/stop hysteresis");
+
+        // 命令归零：不应立刻退出，而是等到相位回到 θ≈0（四足同时支撑、
+        // 足端正好在标称位）再退出，这样退出瞬间没有足端目标跳变。
+        auto st_prev = gait.Update(10.5, GaitCommand{0.0, 0.0, 0.0});
+        const bool waiting = gait.stepping();
+        bool exited = false;
+        bool no_jump = false;
+        for (double t = 10.505; t <= 10.5 + p.period + 0.2; t += 0.005) {
+            const auto st = gait.Update(t, GaitCommand{});
+            if (!gait.stepping()) {
+                exited = true;
+                no_jump = true;
+                for (int leg = 0; leg < kNumLegs; ++leg)
+                    no_jump &= (st[leg].foot_pos - st_prev[leg].foot_pos).norm() < 1e-3;
+                break;
+            }
+            st_prev = st;
+        }
+        Check(stopped && started && waiting && exited && no_jump,
+              "start/stop hysteresis (soft stop, no target jump)");
     }
 
     // ---- 3) 六种单轴 + 混合命令：可达且不越限 ----
