@@ -140,7 +140,10 @@ namespace interface{
             socklen_t clientAddrLen = sizeof(clientAddr);
 
             while(start_thread_flag_){
-                fds = epoll_wait(efd, evptr, 1, -1);    //阻塞监听，直到有事件发生
+                // 用 100 ms 超时而不是 -1：Stop() 置位 start_thread_flag_ 后，本线程
+                // 能在有限时间内退出，避免 join 卡死。
+                fds = epoll_wait(efd, evptr, 1, 100);
+                if (fds <= 0) continue;  // 超时/错误：回到 while 重新检查退出标志
                 if(evptr[0].events & EPOLLIN){   
                     int ret = read(evptr->data.fd, &value, sizeof(uint64_t));
                     if (ret == -1) {

@@ -69,6 +69,7 @@ class MuJoCoSimulation:
 
         self.model = mujoco.MjModel.from_xml_path(xml_full)
         self.model.opt.timestep = DT
+        self._apply_model_overrides()
 
         # 接触模型：**默认只让足端球与地面接触**。本 MJCF 的小腿碰撞 mesh（`*_SHANK_collision`，
         # 与 visual 同一个 shank.STL，整条小腿）在名义站姿下也压地——实测它承担约 97% 的支撑力
@@ -130,6 +131,54 @@ class MuJoCoSimulation:
         self.viewer.cam.azimuth = 135
         self.viewer.cam.elevation = -18
         self.viewer.cam.lookat[:] = np.array([0.4, 0.0, 0.45])
+
+    def _apply_model_overrides(self):
+        """仿真层叠加执行器/足垫模型（**默认按本工程标定值开启**）。
+
+        官方 MJCF 与 URDF 均未给关节 damping/armature，足端接触为 condim=3（无扭转摩擦）；
+        真机减速器有转子惯量与粘性阻尼，橡胶球足有接触斑扭转刚度。这些属于模型的简化，
+        不写进 XML，用环境变量控制，便于 A/B 对照和回溯：
+
+          SIM_JOINT_ARM     [kg*m^2]     关节电枢（转子折算）惯量，只作用于 12 个铰链关节
+          SIM_JOINT_DAMP    [N*m*s/rad]  关节粘性阻尼
+          SIM_FOOT_CONDIM   [3|4|6]      足端接触维度，4 启用扭转摩擦
+          SIM_FOOT_TORSION  [-]          扭转摩擦系数（friction 第 2 项），需 condim>=4
+
+        默认值 0.01 / 0.1 / 4 / 0.03 为本工程开环基线标定值；
+        要回到与官方模型完全一致的行为，四个都设 0。
+        """
+        arm = float(os.environ.get("SIM_JOINT_ARM", "0.01") or 0.0)
+        damp = float(os.environ.get("SIM_JOINT_DAMP", "0.1") or 0.0)
+        condim = int(os.environ.get("SIM_FOOT_CONDIM", "4") or 0)
+        torsion_raw = os.environ.get("SIM_FOOT_TORSION", "0.03").strip()
+        torsion = float(torsion_raw) if torsion_raw and float(torsion_raw) > 0 else None
+        if arm <= 0.0 and damp <= 0.0 and condim <= 0 and torsion is None:
+            print("[sim] model override: off (与官方模型一致)")
+            return
+        torsion_effective = torsion if torsion is not None else 0.03
+
+        hinges = [int(self.model.jnt_dofadr[j]) for j in range(self.model.njnt)
+                  if self.model.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE]
+        if arm > 0.0:
+            self.model.dof_armature[hinges] = arm
+        if damp > 0.0:
+            self.model.dof_damping[hinges] = damp
+
+        foot_ids = []
+        if condim >= 3 or torsion is not None:
+            for i in range(self.model.ngeom):
+                name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i) or ""
+                if name.endswith("FOOT_collision"):
+                    foot_ids.append(i)
+        if condim >= 3 and foot_ids:
+            self.model.geom_condim[foot_ids] = condim
+        if torsion is not None and foot_ids:
+            self.model.geom_friction[foot_ids, 1] = torsion
+
+        print(f"[sim] model override: armature={arm:g} damping={damp:g} "
+              f"foot_condim={condim if condim >= 3 else 3} "
+              f"foot_torsion={torsion_effective:g} "
+              f"({len(foot_ids)} foot geoms)")
 
     def _set_initial_pose(self, key: str):
         """初始位姿。默认从**站立平衡位**开始（关节 = 站立构型，基座 = 足端刚好相切的高度），
