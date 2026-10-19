@@ -12,10 +12,23 @@
 
 #include "common_types.h"
 #include <atomic>
+#include <cstdint>
 
 using namespace types;
 
 namespace interface{
+// One published observation, never a collection of independently read getters.
+// Hardware adapters must opt in once their SDK snapshot semantics are verified.
+struct RobotStateSnapshot {
+    double time = 0.0;
+    std::uint64_t sequence = 0;
+    std::int64_t received_wall_ns = 0;  // steady_clock, for observation age
+    Vec3f rpy = Vec3f::Zero(), omega_body = Vec3f::Zero(), acc_body = Vec3f::Zero();
+    Eigen::Matrix<float, 12, 1> q = Eigen::Matrix<float, 12, 1>::Zero();
+    Eigen::Matrix<float, 12, 1> dq = Eigen::Matrix<float, 12, 1>::Zero();
+    Eigen::Matrix<float, 12, 1> tau = Eigen::Matrix<float, 12, 1>::Zero();
+};
+
 class RobotInterface{
 private:
     /* data */
@@ -50,6 +63,8 @@ public:
      * @return double        time stamp
      */
     virtual double GetInterfaceTimeStamp() = 0;
+
+    virtual bool ReadState(RobotStateSnapshot* out) { return false; }
 
     /**
      * @brief Get the joint position of the robot

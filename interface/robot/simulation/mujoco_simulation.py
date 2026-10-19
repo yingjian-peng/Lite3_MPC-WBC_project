@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import mujoco
 import mujoco.viewer
+from model_config import ModelOverrides, apply_model_overrides
 from colorama import init, Fore, Style
 
 # Initialize colorama for colored terminal output
@@ -39,7 +40,7 @@ STAND_BASE_HEIGHT = 0.3485
 # 初始位姿模式：`stand`（默认）= 从站立平衡位开始；`drop` = 旧的 MJCF 默认
 # （基座抬到 1 m + URDF 折叠关节角，等价于「高空折叠坠落再自己撑起来」）。
 # 落地本身是确定的，但**自撑起**过程对控制帧时序极敏感，会给所有行走试验注入
-# 不可重复的初始条件（同一场景 0.34 m vs 0.80 m，见 docs/04 §8「S9 第三项」）。
+# 不可重复的初始条件（历史同场景曾出现 0.34 m vs 0.80 m）。
 SIM_INIT_POSE = os.environ.get("SIM_INIT_POSE", "stand").strip()
 SIM_INIT_HEIGHT = float(os.environ.get("SIM_INIT_HEIGHT", str(STAND_BASE_HEIGHT)))
 
@@ -48,12 +49,12 @@ FOOT_BODY_NAMES = ("FL_FOOT", "FR_FOOT", "HL_FOOT", "HR_FOOT")
 kNumFeet = len(FOOT_BODY_NAMES)
 
 class MuJoCoSimulation:
-    def __init__(self, model_key: str = MODEL_NAME, 
+    def __init__(self, model_key: str = MODEL_NAME,
                  xml_relpath: str = XML_PATH,
-                 local_port: int = LOCAL_PORT, 
-                 ctrl_ip: str = CTRL_IP, 
+                 local_port: int = LOCAL_PORT,
+                 ctrl_ip: str = CTRL_IP,
                  ctrl_port: int = CTRL_PORT):
-        
+
         # UDP interface
         self.local_port = local_port
         self.ctrl_addr = (ctrl_ip, ctrl_port)
@@ -123,6 +124,13 @@ class MuJoCoSimulation:
         self.input_tq = np.zeros_like(self.kp_cmd)
         # 收到第一帧控制包之前用内部 PD 保持初始姿态（见 _apply_joint_torque）
         self.received_cmd = False
+        self._command_lock = threading.Lock()
+        self._latest_command = None  # one immutable packet + wall receive time
+        self.command_timeout = float(os.environ.get("SIM_COMMAND_TIMEOUT", "0.1"))
+        if not np.isfinite(self.command_timeout) or self.command_timeout <= 0:
+            raise ValueError("SIM_COMMAND_TIMEOUT must be positive")
+        self.command_age = 0.0
+        self.command_expired = False
         self.qpos_hold = self.data.qpos[7:7+self.dof_num].copy().reshape(-1, 1)
         self.hold_kp = float(os.environ.get("SIM_HOLD_KP", "200"))
         self.hold_kd = float(os.environ.get("SIM_HOLD_KD", "5"))
@@ -163,52 +171,9 @@ class MuJoCoSimulation:
         self.viewer.cam.lookat[:] = np.array([0.4, 0.0, 0.45])
 
     def _apply_model_overrides(self):
-        """仿真层叠加执行器/足垫模型（**默认按本工程标定值开启**）。
-
-        官方 MJCF 与 URDF 均未给关节 damping/armature，足端接触为 condim=3（无扭转摩擦）；
-        真机减速器有转子惯量与粘性阻尼，橡胶球足有接触斑扭转刚度。这些属于模型的简化，
-        不写进 XML，用环境变量控制，便于 A/B 对照和回溯：
-
-          SIM_JOINT_ARM     [kg*m^2]     关节电枢（转子折算）惯量，只作用于 12 个铰链关节
-          SIM_JOINT_DAMP    [N*m*s/rad]  关节粘性阻尼
-          SIM_FOOT_CONDIM   [3|4|6]      足端接触维度，4 启用扭转摩擦
-          SIM_FOOT_TORSION  [-]          扭转摩擦系数（friction 第 2 项），需 condim>=4
-
-        默认值 0.01 / 0.1 / 4 / 0.03 为本工程开环基线标定值；
-        要回到与官方模型完全一致的行为，四个都设 0。
-        """
-        arm = float(os.environ.get("SIM_JOINT_ARM", "0.01") or 0.0)
-        damp = float(os.environ.get("SIM_JOINT_DAMP", "0.1") or 0.0)
-        condim = int(os.environ.get("SIM_FOOT_CONDIM", "4") or 0)
-        torsion_raw = os.environ.get("SIM_FOOT_TORSION", "0.03").strip()
-        torsion = float(torsion_raw) if torsion_raw and float(torsion_raw) > 0 else None
-        if arm <= 0.0 and damp <= 0.0 and condim <= 0 and torsion is None:
-            print("[sim] model override: off (与官方模型一致)")
-            return
-        torsion_effective = torsion if torsion is not None else 0.03
-
-        hinges = [int(self.model.jnt_dofadr[j]) for j in range(self.model.njnt)
-                  if self.model.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE]
-        if arm > 0.0:
-            self.model.dof_armature[hinges] = arm
-        if damp > 0.0:
-            self.model.dof_damping[hinges] = damp
-
-        foot_ids = []
-        if condim >= 3 or torsion is not None:
-            for i in range(self.model.ngeom):
-                name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i) or ""
-                if name.endswith("FOOT_collision"):
-                    foot_ids.append(i)
-        if condim >= 3 and foot_ids:
-            self.model.geom_condim[foot_ids] = condim
-        if torsion is not None and foot_ids:
-            self.model.geom_friction[foot_ids, 1] = torsion
-
-        print(f"[sim] model override: armature={arm:g} damping={damp:g} "
-              f"foot_condim={condim if condim >= 3 else 3} "
-              f"foot_torsion={torsion_effective:g} "
-              f"({len(foot_ids)} foot geoms)")
+        self.model_settings = ModelOverrides.from_environment()
+        self.model_metadata = apply_model_overrides(self.model, self.model_settings)
+        print(f"[sim] model override: {self.model_settings}")
 
     def _set_initial_pose(self, key: str):
         """初始位姿。默认从**站立平衡位**开始（关节 = 站立构型，基座 = 足端刚好相切的高度），
@@ -254,7 +219,7 @@ class MuJoCoSimulation:
         print(f"{Fore.YELLOW}[Joint] Velocity  :{Style.RESET_ALL} {format_array(dq.flatten())}")
         print(f"{Fore.YELLOW}[Joint] Torque    :{Style.RESET_ALL} {format_array(tau.flatten())}")
         print(f"{Fore.MAGENTA}[Joint Cmd] Target Pos:{Style.RESET_ALL} {format_array(self.pos_cmd.T.flatten())}")
-        print(f"{Fore.MAGENTA}[Joint Cmd] Actual Pos:{Style.RESET_ALL} {format_array(q.T.flatten())}")     
+        print(f"{Fore.MAGENTA}[Joint Cmd] Actual Pos:{Style.RESET_ALL} {format_array(q.T.flatten())}")
         print(f"{Fore.MAGENTA}[Joint Cmd] Target Vel:{Style.RESET_ALL} {format_array(self.vel_cmd.T.flatten())}")
         print(f"{Fore.MAGENTA}[Joint Cmd] Actual Vel:{Style.RESET_ALL} {format_array(dq.T.flatten())}")
         print(f"{Fore.MAGENTA}[Joint Cmd] Kp Term   :{Style.RESET_ALL} {format_array(self.kp_cmd.T.flatten())}")
@@ -309,7 +274,8 @@ class MuJoCoSimulation:
         vals = [self.timestamp, *base, *v, *w, *q, *dq,
                 *self.pos_cmd.flatten(), *self.kp_cmd.flatten(),
                 *tau_cmd, *tau_act, *all_force.flatten(),
-                *foot_force.flatten(), *foot_pos.flatten()]
+                *foot_force.flatten(), *foot_pos.flatten(),
+                self.command_age, int(self.command_expired)]
         f.write(",".join(f"{x:.6g}" for x in vals) + "\n")
         f.flush()
 
@@ -331,97 +297,99 @@ class MuJoCoSimulation:
                     + [f"atau{i}" for i in range(self.dof_num)]     # ctrlrange 夹取后实际力矩
                     + ["fxall", "fyall", "fzall"]                   # 全部接触合力（世界系）
                     + [f"f{x}{leg}" for leg in range(kNumFeet) for x in ("x", "y", "z")]
-                    + [f"p{x}{leg}" for leg in range(kNumFeet) for x in ("x", "y", "z")])
+                    + [f"p{x}{leg}" for leg in range(kNumFeet) for x in ("x", "y", "z")]
+                    + ["command_age_wall", "command_expired"])
             log_f.write(",".join(cols) + "\n")
             log_f.flush()
             print(f"[INFO] logging to {SIM_LOG}")
 
         # Main simulation loop
         step = 0
-        last_time = time.time()
+        last_time = time.monotonic()
         while True:
-            if time.time() - last_time >= DT:
-                last_time = time.time()
+            remaining = DT - (time.monotonic() - last_time)
+            if remaining > 0:
+                # Release the GIL so the UDP receiver can publish fresh commands.
+                # Busy-waiting here can starve it and spuriously trip the watchdog.
+                time.sleep(remaining)
+                continue
+            last_time = time.monotonic()
 
-                step += 1
-                # 控制律
+            step += 1
+            # 控制律
 
-                # 外力扰动窗口（默认关闭）
-                if self.push_dur > 0.0:
-                    active = self.push_t0 <= self.timestamp < self.push_t0 + self.push_dur
-                    self.data.xfrc_applied[self.push_body, 0] = self.push_fx if active else 0.0
-                    self.data.xfrc_applied[self.push_body, 1] = self.push_fy if active else 0.0
+            # 外力扰动窗口（默认关闭）
+            if self.push_dur > 0.0:
+                active = self.push_t0 <= self.timestamp < self.push_t0 + self.push_dur
+                self.data.xfrc_applied[self.push_body, 0] = self.push_fx if active else 0.0
+                self.data.xfrc_applied[self.push_body, 1] = self.push_fy if active else 0.0
 
-                self._apply_joint_torque()
-                # 模拟一步
-                mujoco.mj_step(self.model, self.data)
+            self._apply_joint_torque()
+            # 模拟一步
+            mujoco.mj_step(self.model, self.data)
 
-                self.timestamp = step * DT
+            self.timestamp = step * DT
 
-                # 采样 & 发送观测
-                self._send_robot_state(step)
-                if log_f is not None and step % SIM_LOG_EVERY == 0:
-                    self._write_log(log_f)
-                # 可视化
-                if self.viewer and step % RENDER_INTERVAL == 0:
-                    self.viewer.sync()
+            # 采样 & 发送观测
+            self._send_robot_state(step)
+            if log_f is not None and step % SIM_LOG_EVERY == 0:
+                self._write_log(log_f)
+            # 可视化
+            if self.viewer and step % RENDER_INTERVAL == 0:
+                self.viewer.sync()
 
-                # Print at 0.5 Hz (every 2 seconds)
-                if PRINT_DEBUG:
-                    current_time = time.perf_counter()
-                    if current_time - self.last_print_time >= 2.0:
-                        self.print_debug_info()
-                        self.last_print_time = current_time
+            # Print at 0.5 Hz (every 2 seconds)
+            if PRINT_DEBUG:
+                current_time = time.perf_counter()
+                if current_time - self.last_print_time >= 2.0:
+                    self.print_debug_info()
+                    self.last_print_time = current_time
 
-                if SIM_DURATION > 0 and self.timestamp >= SIM_DURATION:
-                    print(f"[INFO] reached SIM_DURATION={SIM_DURATION}s, exiting")
-                    if log_f is not None:
-                        log_f.close()
-                    return
-                    
+            if SIM_DURATION > 0 and self.timestamp >= SIM_DURATION:
+                print(f"[INFO] reached SIM_DURATION={SIM_DURATION}s, exiting")
+                if log_f is not None:
+                    log_f.close()
+                return
+
 
     def _udp_receiver(self):
-        """
-        12f kp | 12f pos | 12f kd | 12f vel | 12f tau = 240 bytes
-        """
-        fmt = f'{self.dof_num}f' * 5
-        expected = struct.calcsize(fmt)
+        expected = self.dof_num * 5 * 4
         while True:
-            data, addr = self.recv_sock.recvfrom(expected)
-            if len(data) < expected:
-                print(f"[WARN] UDP packet size {len(data)} != {expected}")
+            packet, _ = self.recv_sock.recvfrom(expected + 1)
+            if len(packet) != expected:
                 continue
-            unpacked = struct.unpack(fmt, data)
-            self.kp_cmd = np.asarray(unpacked[0:self.dof_num], dtype=np.float32).reshape(self.dof_num, 1)
-            self.pos_cmd = np.asarray(unpacked[self.dof_num:self.dof_num * 2], dtype=np.float32).reshape(self.dof_num,
-                                                                                                         1)
-            self.kd_cmd = np.asarray(unpacked[self.dof_num * 2:self.dof_num * 3], dtype=np.float32).reshape(
-                self.dof_num, 1)
-            self.vel_cmd = np.asarray(unpacked[self.dof_num * 3:self.dof_num * 4], dtype=np.float32).reshape(
-                self.dof_num, 1)
-            self.tau_ff = np.asarray(unpacked[self.dof_num * 4:], dtype=np.float32).reshape(self.dof_num, 1)
-            self.received_cmd = True
+            command = np.frombuffer(packet, dtype=np.float32).reshape(5, self.dof_num)
+            if (not np.isfinite(command).all() or (command[0] < 0).any()
+                    or (command[2] < 0).any()):
+                continue
+            with self._command_lock:
+                self._latest_command = (command, time.monotonic())
 
     def _apply_joint_torque(self):
-        # Current joint states
         q = self.data.qpos[7:7+self.dof_num].reshape(-1, 1)
         dq = self.data.qvel[6:6+self.dof_num].reshape(-1, 1)
-
-        if not self.received_cmd:
-            # 收到第一帧控制包之前：用内部 PD 保持**初始姿态**。
-            # 否则等待期间腿是软的（τ≡0）→ 机器人先塌下去，控制器一接管又把关节猛拉回目标
-            # （实测把机器人弹到 0.86 m），而且等待时长还受墙钟影响 → 初始条件不可重复。
+        with self._command_lock:
+            latest = self._latest_command
+        if latest is None:
             self.input_tq = self.hold_kp * (self.qpos_hold - q) - self.hold_kd * dq
             self.data.ctrl[:] = self.input_tq.flatten()
             return
-
-        # τ = kp*(q_d - q) + kd*(dq_d - dq) + τ_ff
-        self.input_tq = (
-            self.kp_cmd * (self.pos_cmd - q) +
-            self.kd_cmd * (self.vel_cmd - dq) +
-            self.tau_ff
-        )
-        # Write to control buffer
+        command, receive_time = latest
+        self.received_cmd = True
+        self.command_age = time.monotonic() - receive_time
+        self.command_expired = self.command_age > self.command_timeout
+        if self.command_expired:
+            self.kp_cmd = np.zeros_like(q)
+            self.pos_cmd = q.copy()
+            self.kd_cmd = np.full_like(q, 2.5)
+            self.vel_cmd = np.zeros_like(q)
+            self.tau_ff = np.zeros_like(q)
+        else:
+            # Only the stepping thread changes the applied command/log fields.
+            self.kp_cmd, self.pos_cmd, self.kd_cmd, self.vel_cmd, self.tau_ff = (
+                row.reshape(-1, 1) for row in command)
+        self.input_tq = (self.kp_cmd * (self.pos_cmd - q)
+                         + self.kd_cmd * (self.vel_cmd - dq) + self.tau_ff)
         self.data.ctrl[:] = self.input_tq.flatten()
 
     def quaternion_to_euler(self, q):
@@ -450,7 +418,7 @@ class MuJoCoSimulation:
         # Joints
         q = self.data.qpos[7:7+self.dof_num]
         dq = self.data.qvel[6:6+self.dof_num]
-        tau = self.input_tq.flatten()
+        tau = self.data.actuator_force.copy()
 
         # Pack and send
         payload = np.concatenate((
@@ -464,7 +432,7 @@ class MuJoCoSimulation:
         ))
         fmt = "1d" + f"{len(payload)-1}f"
         try:
-            self.send_sock.sendto(struct.pack(fmt, *payload), 
+            self.send_sock.sendto(struct.pack(fmt, *payload),
                                   self.ctrl_addr)
         except socket.error as ex:
             print(f"[UDP send] {ex}")

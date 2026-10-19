@@ -3,14 +3,14 @@
  * @brief Lite3 平地基座模型：运动学（FK/IK/雅可比）。动力学（M/h/Jc）在后续步骤补入。
  *
  * 数值来源：robot_models/robots/Lite3/Lite3_mjcf/mjcf/Lite3.xml（以 MuJoCo 对表为准）。
- * 坐标约定（与 docs/02 §3 一致）：
+ * 坐标约定（见 docs/09_MPC_WBC重新推导与基础契约.md 第 1 节）：
  *   机体系 B：x 向前、y 向左、z 向上（右手系）。
  *   广义速度 qvel = [v_world(3); omega_body(3); dq(12)]，与 MuJoCo free joint 一致。
  * 关节顺序：FL, FR, HL, HR，每腿 HipX, HipY, Knee（与 MJCF / SDK 一致）。
  *
  * 符号约定（关键）：MuJoCo 中 HipX 轴为 (-1,0,0)，HipY/Knee 轴为 (0,-1,0)。
  *   因此本文件中的 qx/qy/qk 直接就是 MuJoCo 关节角，旋转分别为 Rx(-qx)、Ry(-qy)、Ry(-qk)。
- *   这与 docs/03 §1.2 的公式在 HipX 侧摆符号上不同；本文件以 MJCF 为准。
+ *   关节旋转符号以 MJCF 为准。
  */
 #pragma once
 
@@ -203,7 +203,7 @@ public:
     // 逆运动学 IK：足端目标（机体系，FOOT 球心）-> 单腿关节角。
     // HipX 侧摆存在两个分支（对应腿平面的两种构型），都精确到达同一目标：
     //   - 传入 q_seed 时，取与 seed 最近的解（控制中保证连续性，推荐）；
-    //   - 不传 seed 时，取 |qx| 较小的解（docs/03 §1.3 的做法）。
+    //   - 不传 seed 时，取 |qx| 较小的解。
     // 返回 false 表示目标不可达，此时不改动 q_leg_out。
     // -----------------------------------------------------------------------
     bool InverseKinematics(int leg, const Vec3d& p_foot_body, Vec3d* q_leg_out,
@@ -384,7 +384,7 @@ public:
     // -----------------------------------------------------------------------
     // 接触点偏置加速度 Jdot_c·qvel（S7 WBC 的支撑无滑约束需要）。
     //   a_contact = Jc(q)·qdd + Jdot_c(q,qvel)·qvel
-    // docs/04 S7 明确要求「不得省略 Jdot·v」，否则支撑脚在加速时会被判成“应该是零加速度”。
+    // 加速度恒等式 a=J*qdd+Jdot*v 要求保留 Jdot·v，否则支撑脚在加速时会被判成“应该是零加速度”。
     // Jdot_c·qvel 用中心差分算：把广义位置沿 qvel 用指数映射前后各推 ε，取
     //   Jdot·qvel ≈ (Jc(q⊕ε·qvel) − Jc(q⊖ε·qvel))·qvel / (2ε)
     // 注意：Jc 只依赖关节角与基座姿态（与基座位置无关），故只推 R_B 与 q。
@@ -422,6 +422,18 @@ public:
         return p_base_w + R_B * CompositeComBody(q);
     }
 
+    // Exact instantaneous CoM velocity, including joint motion. Columns follow
+    // [v_base_W, omega_B, dq], matching the whole-body dynamics convention.
+    Mat3x18d CompositeComJacobianWorld(const Vec12d& q, const Mat3d& R_B) const {
+        std::array<Mat3d, kNumBodies> R;
+        std::array<Mat3x18d, kNumBodies> Jp, Jr;
+        ComputeBodyJacobians(q, R_B, &R, &Jp, &Jr);
+        Mat3x18d J = Mat3x18d::Zero();
+        for (int i = 0; i < kNumBodies; ++i)
+            J += bodies[i].mass * (Jp[i] - Skew(R[i] * bodies[i].com) * Jr[i]);
+        return J / TotalMass();
+    }
+
     /// 整机绕机体系点 point_body 的合成惯量（表达在机体系）。平行轴定理逐刚体累加。
     Mat3d CompositeInertiaBody(const Vec12d& q, const Vec3d& point_body) const {
         std::array<Mat3d, kNumBodies> R;
@@ -443,7 +455,7 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // 默认站立关节角（docs/03 附录 C：每腿 [0, -0.65, 1.3]）
+    // 默认站立关节角（每腿 [0, -0.65, 1.3]）
     // -----------------------------------------------------------------------
     static Vec3d DefaultStandLegAngles() { return Vec3d(0.0, -0.65, 1.3); }
     static Vec12d DefaultStandJointAngles() {

@@ -17,9 +17,8 @@
 #include "liedown_state.hpp"
 
 #include "rl_control_state_onnx.hpp"
-#include "mpc_control_state.hpp"
+#include <stdexcept>
 
-#include "skydroid_gamepad_interface.hpp"
 #include "retroid_gamepad_interface.hpp"
 #include "keyboard_interface.hpp"
 #include "xbox_gamepad_interface.hpp"
@@ -39,7 +38,6 @@ private:
     std::shared_ptr<StateBase> standup_controller_;
     std::shared_ptr<StateBase> rl_controller_;
     std::shared_ptr<StateBase> rl_controller_onnx_;   // 原 ONNX 策略状态
-    std::shared_ptr<StateBase> mpc_controller_;       // S8 MPC+WBC 状态
     std::shared_ptr<StateBase> joint_damping_controller_;
     std::shared_ptr<StateBase> liedown_controller_;
 
@@ -109,6 +107,13 @@ private:
     }
 public:
     StateMachine(RobotType robot_type){
+        // The old MPC/WBC implementation was deleted. Reject this selection before
+        // constructing any interface (the hardware constructor acquires SDK state).
+        const char* path = std::getenv("LITE3_CONTROL_PATH");
+        if (path && std::string(path) != "onnx")
+            throw std::invalid_argument(
+                "LITE3_CONTROL_PATH: only onnx is currently available; old MPC/WBC was deleted. "
+                "Use mpc_wbc_position_loop_sim for the validated open-loop baseline.");
         #ifdef BUILD_SIMULATION
             // 检测Xbox手柄是否存在
             std::string js_device = "/dev/input/js0";
@@ -145,20 +150,9 @@ public:
         idle_controller_ = std::make_shared<IdleState>(robot_type, "idle_state", data_ptr);
         standup_controller_ = std::make_shared<StandUpState>(robot_type, "standup_state", data_ptr);
 
-        // 启动配置：onnx（默认）或 mpc_wbc（LITE3_CONTROL_PATH=mpc_wbc）。
-        // 两条路径**互斥构造**：选 MPC 时不构造 ONNX 状态（ONNX 构造会立刻加载 policy.onnx，
-        // 缺文件会直接抛异常终止），反之亦然。
-        const char* ctrl_path = std::getenv("LITE3_CONTROL_PATH");
-        const bool use_mpc = (ctrl_path != nullptr && std::string(ctrl_path) == "mpc_wbc");
-        if (use_mpc) {
-            mpc_controller_ = std::make_shared<MPCControlState>(robot_type, "mpc_wbc_control", data_ptr);
-            rl_controller_ = mpc_controller_;
-        } else {
-            rl_controller_onnx_ = std::make_shared<RLControlStateONNX>(robot_type, "rl_control", data_ptr);
-            rl_controller_ = rl_controller_onnx_;
-        }
-        std::cout << "Control path: " << (use_mpc ? "mpc_wbc (MPC+WBC)" : "onnx (RL policy)")
-                  << std::endl;
+        rl_controller_onnx_ = std::make_shared<RLControlStateONNX>(robot_type, "rl_control", data_ptr);
+        rl_controller_ = rl_controller_onnx_;
+        std::cout << "Control path: onnx (RL policy)" << std::endl;
         
 
 

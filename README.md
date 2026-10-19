@@ -18,13 +18,11 @@ flowchart LR
     C[MuJoCo 或 Lite3 真机状态] --> D[机器人统一接口]
     D --> B
     B --> E[ONNX 策略线程]
-    B -. 互斥选择 .-> F[MPC+WBC 控制线程]
     E --> G[12×5 关节命令]
-    F -. 接入 .-> G
     G --> D
 ```
 
-仿真与真机共用关节命令格式：每个关节发送 `kp、目标位置、kd、目标速度、前馈力矩`。后续 ONNX 与 MPC+WBC 控制线程只能选择其中一条写入关节命令，状态切换仍由现有状态机管理。
+仿真与真机共用关节命令格式：每个关节发送 `kp、目标位置、kd、目标速度、前馈力矩`。主状态机当前使用 ONNX；已验证开环由独立 app 运行。旧 MPC/WBC 全部删除，新闭环正在从基础契约重建。
 
 ## 3. 工程结构
 
@@ -69,7 +67,7 @@ cmake --build build -j
 
 ### MPC+WBC 开发对表（可选）
 
-MPC+WBC 算法位于 `mpc_wbc/`，当前已完成运动学（FK/IK/雅可比）、全身动力学（`M/h/Jc`）、trot 步态/足端轨迹、位置环基线（S4）、状态估计（S5）、SRBD 预测时域 MPC（S6）、统一 Weighted-QP WBC（S7，含自研内点法 QP 求解器）与控制器编排（S8：`mpc_wbc/05_mpc_wbc_controller.hpp` + `state_machine/mpc_control_state.hpp`，MPC 独立线程、命令平滑/滞回/安全退化已在 MuJoCo 闭环验证；trot 行走稳定性作为 S9 第一项继续）。开启对表测试后可用 CTest 跑 MuJoCo 数值对照（需要 `python3` 与 `mujoco`）：
+`mpc_wbc/` 当前保留运动学、刚体动力学、步态、基础估计器和冻结开环，旧 MPC/WBC、QP 求解器及状态机入口已删除。新基础包括一致快照、有效动力学、坐标导数和总力矩契约；数学定义见 [重新推导与基础契约](docs/09_MPC_WBC重新推导与基础契约.md)，完成情况见 [实施进度](docs/04_Lite3_MPC_WBC实现步骤与里程碑.md)。当前数值检查（需要 Python 与 MuJoCo）：
 
 ```bash
 cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON
@@ -77,33 +75,18 @@ cmake --build build -j
 cd build && ctest -R mpc_wbc --output-on-failure
 ```
 
-SRBD-MPC 离线自检（不需要 MuJoCo）：
-
-```bash
-cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON
-cmake --build build -j
-mpc_wbc/test/run_srbd_mpc_test.sh
-```
-
-Weighted-QP WBC 离线自检 + MuJoCo 正动力学复核（自研 QP 单测 → WBC 自检 → 把解回灌 MuJoCo）：
-
-```bash
-mpc_wbc/test/run_wbc_test.sh
-```
-
 位置环跑步基线（无头仿真 + 自动分析）：
 
 ```bash
 cmake -S . -B build -DBUILD_MPC_WBC_SIM=ON
 cmake --build build -j
-mpc_wbc/test/run_s4_position_loop.sh 24
+python3 mpc_wbc/test/run_baseline.py --scenario mpc_wbc/test/scenarios/axis_fwd.csv --out build/baseline_fwd
 ```
 
-控制器编排（S8）离线自检（不需要 MuJoCo）与整机闭环（站立/行走 harness）：
+低/中/高各六方向，每段 10 s 的回归（输出目录需新建）：
 
 ```bash
-mpc_wbc/test/run_s8_mpc_wbc.sh            # 离线 8 段确定性自检
-mpc_wbc/test/run_s8_mpc_wbc.sh stand      # + 站立保持 20 s（MuJoCo 闭环）
+python3 mpc_wbc/test/run_baseline.py --suite single10s --out build/baseline_single10s
 ```
 
 `BUILD_MPC_WBC_TESTS` 默认关闭，不影响上面的 ONNX 仿真/真机构建。详见 [mpc_wbc/README.md](mpc_wbc/README.md) 与 [MPC+WBC 实现步骤与里程碑](docs/04_Lite3_MPC_WBC实现步骤与里程碑.md)。
@@ -123,15 +106,7 @@ cd build
 
 控制程序当前通过运行目录定位 `onnx/policy/ppo/policy.onnx`，因此上述 `cd build` 不应省略。MuJoCo 加载的平地场景为 `robot_models/robots/Lite3/Lite3_mjcf/mjcf/Lite3_flat.xml`。
 
-要用 MPC+WBC 走状态机路径（与 ONNX **互斥**，选 MPC 时不会构造 ONNX 状态，因此不需要 `policy.onnx`）：
-
-```bash
-# 终端 2
-cd build
-LITE3_CONTROL_PATH=mpc_wbc ./rl_deploy
-```
-
-按键语义不变（`z` 站起 → `c` 进入运动控制 → `w/a/s/d/q/e` 速度命令 → `x` 趴下 / `r` 阻尼）。当前状态：起立→接管→站立、前进、超限自动切阻尼均已在仿真验证；trot 长时间行走仍不稳（见 [mpc_wbc/README.md](mpc_wbc/README.md) 的 S8 边界，S9 第一项）。其他 MPC+WBC 参数可用 `MPC_WBC_*` 环境变量覆盖（见 `state_machine/mpc_control_state.hpp`）。
+旧 `LITE3_CONTROL_PATH=mpc_wbc` 已禁用，会在构造机器人接口前报错退出。新闭环完成独立验证后再接回状态机。
 
 ### 5. 当前 ONNX 控制按键
 
@@ -164,6 +139,8 @@ Retroid 手柄：Y 站起、A 进入当前 ONNX 控制、X 趴下、同时按下
 
 
 各文件职责和模块关系见 [工程结构与文件说明](docs/01_project_structure.md)。模型说明见 [robot_models/README.md](robot_models/README.md)。
+
+开发文档：[设计指标](docs/00_设计指标.md) → [重建进度](docs/04_Lite3_MPC_WBC实现步骤与里程碑.md) → [新闭环推导](docs/09_MPC_WBC重新推导与基础契约.md)。
 
 ## 7. 来源与许可
 

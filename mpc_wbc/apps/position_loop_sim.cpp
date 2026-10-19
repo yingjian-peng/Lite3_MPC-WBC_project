@@ -14,6 +14,7 @@
 
 #include "00_lite3_model.hpp"
 #include "02_gait_trajectory.hpp"
+#include "baseline_profile.hpp"
 #include "scenario_io.hpp"
 
 #include <algorithm>
@@ -42,62 +43,6 @@ struct Phase {
 double SmoothStep(double x) {
     x = std::max(0.0, std::min(1.0, x));
     return x * x * (3.0 - 2.0 * x);
-}
-
-/// 以最大变化量向目标靠近（docs/03 §7.1 的 `Approach`，参考实现同名）。
-double Approach(double current, double target, double max_delta) {
-    const double d = target - current;
-    if (std::fabs(d) <= max_delta) return target;
-    return current + (d >= 0.0 ? max_delta : -max_delta);
-}
-
-/// 步幅限幅：Δp_leg = t_stance·(v_cmd + ω×p0_xy) 对各轴线性，故按「各腿各轴超出比例的最大值」
-/// 统一缩放命令即可（与参考实现「步长限幅」等价）。
-GaitCommand LimitStep(const GaitCommand& in, double t_stance, const Vec12d& nominal, double step_x,
-                      double step_y) {    double s = 1.0;
-    for (int leg = 0; leg < kNumLegs; ++leg) {
-        const Vec3d p0 = nominal.segment<3>(3 * leg);
-        const double px = p0.x(), py = p0.y();
-        const double dpx = t_stance * (in.vx - in.wz * py);
-        const double dpy = t_stance * (in.vy + in.wz * px);
-        if (step_x > 0.0 && std::fabs(dpx) > step_x) s = std::min(s, step_x / std::fabs(dpx));
-        if (step_y > 0.0 && std::fabs(dpy) > step_y) s = std::min(s, step_y / std::fabs(dpy));
-    }
-    GaitCommand out;
-    out.vx = in.vx * s;
-    out.vy = in.vy * s;
-    out.wz = in.wz * s;
-    return out;
-}
-
-/// 方案 B 速度包络（docs/00 §9.3）：单轴区间 x 0.60 / y 0.35 / z 0.50，
-/// 并要求 s = hypot(vx,vy) + wz_weight·|wz| ≤ s_max（等价最差支撑步幅 ≤ 0.19 m）。
-/// 超出时三轴同比例缩比，保持运动方向不变；单轴裁剪与归一化缩比顺序无关。
-struct EnvelopeParams {
-    double vx_max = 0.60;      // m/s
-    double vy_max = 0.35;      // m/s
-    double wz_max = 0.50;      // rad/s
-    double s_max = 0.67;       // m/s（等效平移速度上限）
-    double wz_weight = 0.18;   // 转向折算成平移的权重 [m]
-    bool enabled = true;       // S4_ENV_LIMIT=0 可关闭
-};
-
-GaitCommand LimitEnvelope(const GaitCommand& in, const EnvelopeParams& env) {
-    GaitCommand out = in;
-    if (!env.enabled) return out;
-    if (env.vx_max > 0.0) out.vx = std::clamp(out.vx, -env.vx_max, env.vx_max);
-    if (env.vy_max > 0.0) out.vy = std::clamp(out.vy, -env.vy_max, env.vy_max);
-    if (env.wz_max > 0.0) out.wz = std::clamp(out.wz, -env.wz_max, env.wz_max);
-    if (env.s_max > 0.0) {
-        const double s = std::hypot(out.vx, out.vy) + env.wz_weight * std::fabs(out.wz);
-        if (s > env.s_max) {
-            const double k = env.s_max / s;
-            out.vx *= k;
-            out.vy *= k;
-            out.wz *= k;
-        }
-    }
-    return out;
 }
 
 /// 起立段固定为 settle/stand/hold（与 S8 harness 的 settle/fold/raise/hold 等价分工），
@@ -138,11 +83,12 @@ std::vector<Phase> BuildPhases() {    std::vector<Phase> p = {
 
 int main(int argc, char** argv) {
     const std::string phases_csv = (argc > 1) ? argv[1] : "s4_phases.csv";
-    // kp/kd：docs/03 附录 C 给的是 100/2.5；实测（仅足端接触模型、抬脚 0.10 m）把 kp 提到 200
+    // kp/kd：早期实验使用 100/2.5；实测（仅足端接触模型、抬脚 0.10 m）把 kp 提到 200
     // 让稳态速度从命令的 0.65 倍升到 0.95 倍（峰值力矩 18.4 N·m，限幅 30 N·m 有余量）。
     // 再往上（kp300）会打到限幅、滑移回升、位移反而掉到 0.75 倍 —— 200 是拐点。
-    double kp = 200.0, kd = 2.5;
-    // 开环调参旋钮（docs/04 §7）：步态形状与 PD 增益、支撑相竖直预压。
+    const BaselineProfile baseline;
+    double kp = baseline.kp, kd = baseline.kd;
+    // 开环调参旋钮：步态形状与 PD 增益、支撑相竖直预压。
     // 开环能走多快基本由「支撑脚是否真的钉住 + 摆动脚是否真的离地」决定，
     // 所以这几个量要能单独扫。
     GaitParams gait_params;
@@ -152,19 +98,19 @@ int main(int argc, char** argv) {
     bool global_duty_set = false;
     bool global_swing_set = false;
 
-    // ---- docs/03 §7 那套 M0/M1 工程细节（默认全关，保持当前基线；给了值就按参考实现跑）----
+    // ---- M0/M1 实验性工程细节（默认全关，保持当前基线；给了值就按参考实现跑）----
     // 参考值：死区 0.06、命令斜坡 2.5 /s、起步足端混合 1.0 s、关节目标速率限幅 6 rad/s、
     // 步幅限幅 stepX/stepY = 0.10/0.035 m、M1 增益 0.5/0.5/0.5 + 一阶低通 0.05 s + 单脚限幅 0.04 m。
     double deadzone = 0.0;      // S4_DEADZONE
     // 默认 1.5 /s：二轴混合换向时，若让速度命令直接阶跃，支撑脚目标会在一帧内跳约 4 cm，
     // 关节力矩瞬间打满并失稳；1.5 /s 下 0.5 m/s 约 0.33 s 到位，稳态分析仍跳过前 2 s。
-    double cmd_rate = 1.5;      // S4_RAMP
+    double cmd_rate = baseline.ramp_accel;      // S4_RAMP
     // 减速斜坡单独放慢（S4_RAMP_DECEL，默认 0.75 /s）：分段的低速周期可达 1.2 s，
     // 减速时命令会穿过低速段，此时足端行程 dp=v·T·d 被放大（v=0.2 m/s 时 0.16 m）。
     // 若仍按 1.5 /s 急停，四足会被地面同时拖停，实测俯仰/横滚冲击达 12–13°；
     // 减到 0.75 /s 后降到 6–7°，且不影响加速段与稳态指标。
-    double cmd_decel = 0.75;    // S4_RAMP_DECEL
-    double blend_win = 0.8;     // S4_BLEND
+    double cmd_decel = baseline.ramp_decel;    // S4_RAMP_DECEL
+    double blend_win = baseline.foot_blend_time;     // S4_BLEND
     double jv_rate = 0.0;       // S4_JV_RATE
     double step_x = 0.0;        // S4_STEP_X
     double step_y = 0.0;        // S4_STEP_Y
@@ -184,13 +130,13 @@ int main(int argc, char** argv) {
     // 标称足位前后偏移 [m]（S4_NOM_X）。官方模型质心在髋中心后方 7.2 mm，而默认站立角的
     // 标称落足中心在前方 6.1 mm，两者相差 13.3 mm；默认取 -0.0133 把支撑中心移到质心下方。
     // 实测：该配平把前进+侧移的侧倾从 18.2° 降到 2.4–4.1°。
-    double nom_x = -0.0133;     // S4_NOM_X（0 可回到未配平）
-    // ---- 方案 B：速度包络限幅（docs/00 §9.3）----
+    double nom_x = baseline.nominal_x;     // S4_NOM_X（0 可回到未配平）
+    // ---- 方案 B：速度包络限幅（docs/00 第 2 节）----
     // 单轴区间 x 0.60 / y 0.35 / z 0.50，并要求 hypot(vx,vy)+0.18|wz| ≤ 0.67。
     // 依据：三轴同时满量程时，0.50/0.30/0.40 已是开环可用边界；
     // 超过该归一化上限后，最差支撑步幅 >0.19 m 会出现侧倾（先出现于前进+右移+逆时针）。
     // 想回到“命令原样执行”的旧行为，设 S4_ENV_LIMIT=0。
-    EnvelopeParams env;
+    EnvelopeParams env = baseline.envelope;
     if (const char* e = std::getenv("S4_ENV_LIMIT")) env.enabled = std::atoi(e) != 0;
     if (const char* e = std::getenv("S4_ENV_VX")) env.vx_max = std::atof(e);
     if (const char* e = std::getenv("S4_ENV_VY")) env.vy_max = std::atof(e);
@@ -200,8 +146,8 @@ int main(int argc, char** argv) {
     bool m1_on = false;         // S4_M1
     double m1_gh = 0.5, m1_gr = 0.5, m1_gp = 0.5;
     // 符号默认按**本工程约定**标定（y 向左、roll>0 = 左侧抬起、pitch>0 = 机头向下）：
-    // 参考实现（docs/03 §7.3）用的是 SIGN_ROLL=-1，那是给他们那台机器的约定；照搬会把 roll
-    // 波动放大（roll_sd 0.64°→0.95°、尖峰 3.4°→4.4°），见 docs/04 §8「S9 第五项」。
+    // 早期参考实现用的是 SIGN_ROLL=-1，那是给他们那台机器的约定；照搬会把 roll
+    // 波动放大（roll_sd 0.64°→0.95°、尖峰 3.4°→4.4°）（历史对照观察）。
     double m1_tau = 0.05, m1_dz = 0.04, m1_sr = 1.0, m1_sp = 1.0;
     if (const char* e = std::getenv("S4_KP")) kp = std::atof(e);
     if (const char* e = std::getenv("S4_KD")) kd = std::atof(e);
@@ -241,31 +187,10 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("S4_M1_SIGN_ROLL")) m1_sr = std::atof(e);
     if (const char* e = std::getenv("S4_M1_SIGN_PITCH")) m1_sp = std::atof(e);
 
-    // ---- 三段式步态参数（docs/00）：每段独立整定 T/d/H ----
+    // ---- 三段式步态参数（配置沿革见 docs/05）：每段独立整定 T/d/H ----
     // 默认取设计区间中值；S4_PERIOD/DUTY/SWING_HEIGHT 仍作为全局覆盖（同时作用于三段），
     // S4_LOW_*/S4_MID_*/S4_HIGH_* 用于单段覆盖。
-    SegmentedGaitParams gait_schedule;
-    gait_schedule.low = gait_schedule.mid = gait_schedule.high = gait_params;
-    // 2026-10-18 速度区间更新后的分段重扫（目标：降步频 + 增步幅 → 少抬腿、省电）：
-    //   低速 1.20/0.72/0.07（0.83 Hz，1.33→0.83 Hz，步幅 +60%）
-    //   中速 0.75/0.70/0.07（1.33 Hz，步幅 +20%）
-    //   高速 0.44/0.625/0.07（2.27 Hz，不变）
-    // 中速取 0.75 是为了三段周期接近等比（1.20 : 0.75 : 0.44 ≈ 1.60 : 1.70），
-    // 使段间过渡平缓；中速段的实测指标也是 0.75–0.90 四档里最好的
-    // （侧倾 2.5°、滑移 0.051、成本 0.105）。更慢的 1.05 虽省 2–5 W，
-    // 但会让 mid→high 的周期比拉到 2.4 倍。
-    // 高速段为何不能降频：三轴组合（0.51/0.30/0.43）的偏航波动 p2pYaw 随步幅
-    // 增长，T≥0.46 起就会越过 0.05 阈值；同一步幅下降低占空比同样会失稳
-    // （0.46/0.63 与 0.50/0.58 均 WARN），因此高速段锁定 0.44/0.625。
-    gait_schedule.low.period = 1.20;
-    gait_schedule.low.duty = 0.72;
-    gait_schedule.low.swing_height = 0.07;
-    gait_schedule.mid.period = 0.75;
-    gait_schedule.mid.duty = 0.70;
-    gait_schedule.mid.swing_height = 0.07;
-    gait_schedule.high.period = 0.44;
-    gait_schedule.high.duty = 0.625;
-    gait_schedule.high.swing_height = 0.07;
+    SegmentedGaitParams gait_schedule = BaselineSchedule(gait_params);
     if (global_period_set) {
         gait_schedule.low.period = gait_schedule.mid.period = gait_schedule.high.period = gait_params.period;
     }
@@ -438,7 +363,9 @@ int main(int argc, char** argv) {
         next_tick += period;
         std::this_thread::sleep_until(next_tick);
 
-        const double t = ri->GetInterfaceTimeStamp();
+        RobotStateSnapshot observation;
+        if (!ri->ReadState(&observation)) continue;
+        const double t = observation.time;
         // 每个新时间戳只更新一次目标；仿真和命令发送各自按墙钟运行。
         // 仿真进程退出后不再有新时间戳，控制器应在 1 s 内退出，而不是无限等待。
         if (t <= last_t) {
@@ -478,9 +405,9 @@ int main(int argc, char** argv) {
                         phases[idx].cmd.vy, phases[idx].cmd.wz, applied.vx, applied.vy, applied.wz);
         }
 
-        const Vec12d q_meas = ri->GetJointPosition().cast<double>();
-        const Vec12d dq_meas = ri->GetJointVelocity().cast<double>();
-        const Vec3d omega_meas = ri->GetImuOmega().cast<double>();
+        const Vec12d q_meas = observation.q.cast<double>();
+        const Vec12d dq_meas = observation.dq.cast<double>();
+        const Vec3d omega_meas = observation.omega_body.cast<double>();
         (void)dq_meas;
 
         double eff_kp = kp, eff_kd = kd;
@@ -505,7 +432,7 @@ int main(int argc, char** argv) {
                 q_des = (1.0 - s) * q_start + s * stand;
             }
         } else {
-            // ---- 命令预处理（docs/03 §7.1/§7.2：死区 -> 扫掠增益 -> 包络限幅 -> 步幅限幅 -> 斜坡滤波）----
+            // ---- 命令预处理（死区 -> 扫掠增益 -> 包络限幅 -> 步幅限幅 -> 斜坡滤波）----
             const double dt_ctrl = std::max(1e-6, rel - last_rel);
             last_rel = rel;
             GaitCommand cmd = target_cmd(phases[idx].cmd);
@@ -513,15 +440,7 @@ int main(int argc, char** argv) {
             if (step_x > 0.0 || step_y > 0.0)
                 cmd = LimitStep(cmd, active.period * active.duty, nominal_feet, step_x, step_y);
             if (cmd_rate > 0.0) {
-                // 分轴选择斜坡速率：幅值下降（朝零/反向收敛）时用较慢的减速率。
-                auto ramp_to = [&](double cur, double tgt) {
-                    const bool braking = std::fabs(tgt) < std::fabs(cur);
-                    const double rate = braking ? cmd_decel : cmd_rate;
-                    return Approach(cur, tgt, rate * dt_ctrl);
-                };
-                cmd_filt.vx = ramp_to(cmd_filt.vx, cmd.vx);
-                cmd_filt.vy = ramp_to(cmd_filt.vy, cmd.vy);
-                cmd_filt.wz = ramp_to(cmd_filt.wz, cmd.wz);
+                cmd_filt = RampCommand(cmd_filt, cmd, dt_ctrl, cmd_rate, cmd_decel);
                 cmd = cmd_filt;
             }
 
@@ -608,9 +527,9 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // M1：机身高度/姿态补偿（只改支撑脚目标 z，docs/03 §7.3）
+            // M1：机身高度/姿态补偿（只改支撑脚目标 z）
             if (m1_on && stepping) {
-                const Vec3f rpy_raw = ri->GetImuRpy();
+                const Vec3f rpy_raw = observation.rpy;
                 if (!lp_init) { lp_init = true; rpy_lp = rpy_raw.cast<double>(); }
                 const double a = dt_ctrl / (m1_tau + dt_ctrl);
                 rpy_lp = (1.0 - a) * rpy_lp + a * rpy_raw.cast<double>();
@@ -646,7 +565,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 关节目标速率限幅（docs/03 §7.1：6 rad/s，防 PD 速度项过大）
+        // 关节目标速率限幅（可配置 6 rad/s，防 PD 速度项过大）
         if (jv_rate > 0.0) {
             const double md = jv_rate * std::max(1e-6, rel - last_rel_jv);
             for (int i = 0; i < 12; ++i) q_des(i) = Approach(q_des_prev(i), q_des(i), md);
@@ -661,7 +580,7 @@ int main(int argc, char** argv) {
             }
 
         // 安全：姿态超限则退出
-        const Vec3f rpy = ri->GetImuRpy();
+        const Vec3f rpy = observation.rpy;
         if (idx >= 1 && (std::fabs(rpy(0)) > 0.8f || std::fabs(rpy(1)) > 0.8f)) {
             std::fprintf(stderr, "[s4] attitude limit exceeded at t=%.2f: roll=%.3f pitch=%.3f\n", rel,
                          rpy(0), rpy(1));

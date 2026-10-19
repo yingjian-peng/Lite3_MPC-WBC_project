@@ -12,7 +12,12 @@ using namespace types;
 MotionStateFeedback StateBase::msfb_ = MotionStateFeedback();
 
 int main(){
-    StateMachine state_machine(RobotType::Lite3);
-    state_machine.Run();
-    return 0;
+    try {
+        StateMachine state_machine(RobotType::Lite3);
+        state_machine.Run();
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << std::endl;
+        return 2;
+    }
 }

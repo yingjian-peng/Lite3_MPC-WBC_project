@@ -12,7 +12,7 @@
 set -u
 
 ROOT="${1:-build/robust}"
-PY=/tmp/lite3_venv/bin/python
+PY="${PYTHON:-python3}"
 SWEEP=mpc_wbc/test/sweep_gait_params.py
 SC=mpc_wbc/test/scenarios
 
