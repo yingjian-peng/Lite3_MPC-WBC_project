@@ -86,6 +86,12 @@ struct MpcWbcControllerParams {
     // ---- 子模块参数 ----
     EstimatorParams estimator;
     GaitParams gait;
+    // 三段式步态调度：打开后 gait 只在 use_gait_schedule=false 时生效。
+    // 默认用开环基线 openloop-baseline-v1 的同一套参数，保证两条路径可比。
+    bool use_gait_schedule = true;
+    SegmentedGaitParams gait_schedule = SegmentedGaitParams::Baseline();
+    // 标称足位前后偏移（按整机质心配平，与位置环基线一致）[m]
+    double nominal_x = -0.0133;
     SrbdMpcParams mpc;
     WbcParams wbc;
 };
@@ -235,6 +241,7 @@ public:
     explicit MpcWbcController(const MpcWbcControllerParams& params = MpcWbcControllerParams())
         : params_(params), model_(), estimator_(params.estimator), gait_(params.gait),
           mpc_(params.mpc), wbc_(params.wbc) {
+        ApplyGaitConfig();
         ComputeStandGeometry();
     }
 
@@ -246,6 +253,7 @@ public:
         params_ = p;
         estimator_ = StateEstimator(p.estimator);
         gait_.set_params(p.gait);
+        ApplyGaitConfig();
         mpc_.set_params(p.mpc);
         wbc_.set_params(p.wbc);
         ComputeStandGeometry();
@@ -719,6 +727,17 @@ private:
             }
     }
 
+    /// 应用步态配置：绑定三段式调度表，并按 nominal_x 平移标称足位。
+    /// 幂等：重复调用只补足与已生效值的差值，不会累积叠加。
+    void ApplyGaitConfig() {
+        gait_.SetSchedule(params_.use_gait_schedule ? &params_.gait_schedule : nullptr);
+        const double dx = params_.nominal_x - applied_nominal_x_;
+        if (std::fabs(dx) > 1e-12) {
+            gait_.ShiftNominal(Vec3d(dx, 0.0, 0.0));
+            applied_nominal_x_ = params_.nominal_x;
+        }
+    }
+
     void ComputeStandGeometry() {
         double min_foot_z = 0.0;
         for (int leg = 0; leg < kNumLegs; ++leg)
@@ -733,6 +752,7 @@ private:
     Lite3Model model_;
     StateEstimator estimator_;
     GaitTrajectory gait_;
+    double applied_nominal_x_ = 0.0;  // ApplyGaitConfig 已施加的标称前后偏移
     SrbdPreviewMpc mpc_;
     WeightedWbc wbc_;
 

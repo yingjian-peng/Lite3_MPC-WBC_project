@@ -88,6 +88,28 @@ struct SegmentedGaitParams {
     double blend_vy = 0.075;  // m/s
     double blend_wz = 0.10;   // rad/s
 
+    /// 开环基线 openloop-baseline-v1 的三段参数（docs/00 §3）。
+    /// 位置环与 MPC/WBC 共用这一份，避免两条路径跑不同步态导致结论不可比。
+    static SegmentedGaitParams Baseline() {
+        SegmentedGaitParams s;
+        s.low = s.mid = s.high = GaitParams();
+        s.low.period = 1.20;
+        s.low.duty = 0.72;
+        s.low.swing_height = 0.07;
+        s.mid.period = 0.75;
+        s.mid.duty = 0.70;
+        s.mid.swing_height = 0.07;
+        s.high.period = 0.44;
+        s.high.duty = 0.625;
+        s.high.swing_height = 0.07;
+        for (GaitParams* p : {&s.low, &s.mid, &s.high}) {
+            p->max_vx = s.max_vx;
+            p->max_vy = s.max_vy;
+            p->max_wz = s.max_wz;
+        }
+        return s;
+    }
+
     static double SmoothStep01(double x) {
         x = std::max(0.0, std::min(1.0, x));
         return x * x * (3.0 - 2.0 * x);

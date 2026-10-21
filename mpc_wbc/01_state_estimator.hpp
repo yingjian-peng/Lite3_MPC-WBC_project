@@ -31,6 +31,11 @@ struct EstimatorParams {
     double support_vel_tol = 0.30;         // 支撑腿零速候选的残差阈值 [m/s]
     double max_dt = 0.05;                  // 超过则视为丢包，标记无效 [s]
     double height_filter_tau = 0.0;        // >0 时对高度做一阶低通 [s]
+    // 跳变门限 [m/s^2]：单帧速度估计变化超过 max_accel*dt 时，判定为触地/离地
+    // 瞬间的伪接触（足还在动但被标记为支撑），本帧不更新速度。
+    // 依据：真实机身加速度在 LITE3 包线内不超过 ~25 m/s^2（45 N 侧推约 25），
+    // 而伪接触尖峰在 10 ms 采样下可达 35–45 m/s^2。
+    double max_accel = 30.0;
 };
 
 struct EstimatorInput {
@@ -83,7 +88,7 @@ public:
         const bool time_ok = initialized_ ? (dt > 0.0 && dt <= params_.max_dt) : true;
         if (dt <= 0.0) dt = 0.0;
 
-        // ---- 支撑腿零速反解基座速度（稳健选择：先取 medoid，再取一致子集）----
+        // ---- 支撑腿零速反解基座速度（逐腿创新门限 → medoid → 一致子集）----
         const Mat12x18d J = model_.FootJacobianWorld(in.q, R);
         std::vector<Vec3d> cand;
         std::vector<int> cand_leg;
@@ -96,7 +101,27 @@ public:
             cand_leg.push_back(leg);
         }
 
-        // medoid：到其他候选取值距离之和最小者，避免单个误标接触的腿污染结果
+        // 逐腿创新门限：计划接触标志在触地/离地瞬间会领先或滞后真实接触，此时刚被
+        // 标记为支撑的腿本身还在运动，直接参与反解会把机身速度拉飞（rollout 在
+        // t=2.20 四足全支撑那一帧出现过 0.21 m/s 的假速度）。只保留与上一帧估计
+        // 一致的候选；若全部被拒，说明确实发生快速变化，退回原始候选交由后面的
+        // 全局跳变门限处理。
+        if (initialized_ && dt > 0.0 && !cand.empty()) {
+            const double gate = params_.max_accel * dt;
+            std::vector<Vec3d> kept;
+            std::vector<int> kept_leg;
+            for (size_t i = 0; i < cand.size(); ++i) {
+                if ((cand[i] - state_.base_vel_w).norm() <= gate) {
+                    kept.push_back(cand[i]);
+                    kept_leg.push_back(cand_leg[i]);
+                }
+            }
+            if (!kept.empty()) {
+                cand.swap(kept);
+                cand_leg.swap(kept_leg);
+            }
+        }
+
         const int n_total = static_cast<int>(cand.size());
         std::vector<int> consistent;
         Vec3d base_vel = state_.base_vel_w;
@@ -128,6 +153,16 @@ public:
             }
         }
         state_.num_support = static_cast<int>(consistent.size());
+
+        // ---- 跳变门限：拒绝触地/离地瞬间的伪接触尖峰 ----
+        bool gate_rejected = false;
+        if (initialized_ && vel_ok && dt > 0.0) {
+            const Vec3d jump = base_vel - state_.base_vel_w;
+            if (jump.norm() > params_.max_accel * dt) {
+                base_vel = state_.base_vel_w;
+                gate_rejected = true;
+            }
+        }
 
         // ---- 支撑足恢复高度（只用一致支撑腿）----
         double height_sum = 0.0;
@@ -172,6 +207,7 @@ public:
             if (spread > params_.support_vel_tol) {
                 conf *= params_.support_vel_tol / spread;
             }
+            if (gate_rejected) conf *= 0.3;  // 本帧速度是外推的，降低置信度
         }
         state_.confidence = std::max(0.0, std::min(1.0, conf));
 

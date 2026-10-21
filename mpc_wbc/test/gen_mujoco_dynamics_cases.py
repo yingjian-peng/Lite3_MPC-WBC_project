@@ -91,7 +91,8 @@ def main():
         d.qvel[:] = qvel
 
         mujoco.mj_forward(m, d)
-        mujoco.mj_fullM(m, M, d.qM)
+        # MuJoCo >= 3.0 去掉了 data.qM，mj_fullM 改为 (model, data, dst) 签名
+        mujoco.mj_fullM(m, d, M)
 
         Jc = np.zeros((12, m.nv))
         for leg, bid in enumerate(foot_ids):

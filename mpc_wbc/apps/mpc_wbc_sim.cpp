@@ -173,8 +173,19 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("S8_MPC_PERIOD")) cparams.mpc_period = std::atof(e);
     if (const char* e = std::getenv("S8_HYST")) cparams.wbc_enable_hold_frames = std::atoi(e);
     if (const char* e = std::getenv("S8_CMD_SCALE")) cmd_scale = std::atof(e);
-    std::printf("[s8] pd_scale=%.2f w_swing=%.0f mpc_period=%.3f\n", cparams.kp_scale_wbc,
-                cparams.wbc.w_swing, cparams.mpc_period);
+    // 步态 A/B：S8_GAIT_SCHEDULE=0 关掉三段式调度，退回单一 GaitParams（旧行为）
+    if (const char* e = std::getenv("S8_GAIT_SCHEDULE")) cparams.use_gait_schedule = std::atoi(e) != 0;
+    if (const char* e = std::getenv("S8_GAIT_PERIOD")) cparams.gait.period = std::atof(e);
+    if (const char* e = std::getenv("S8_GAIT_DUTY")) cparams.gait.duty = std::atof(e);
+    if (const char* e = std::getenv("S8_GAIT_SWING")) cparams.gait.swing_height = std::atof(e);
+    if (const char* e = std::getenv("S8_NOM_X")) cparams.nominal_x = std::atof(e);
+    // 摆动足任务增益：w_swing 是 QP 权重，kp/kd_swing 是任务空间 PD 增益。
+    // 实测摆动净空只有目标的 ~25%（FL/HR 有 85–90% 的摆动时间在拖地），优先调 PD 增益。
+    if (const char* e = std::getenv("S8_KP_SWING")) cparams.wbc.kp_swing = std::atof(e);
+    if (const char* e = std::getenv("S8_KD_SWING")) cparams.wbc.kd_swing = std::atof(e);
+    std::printf("[s8] pd_scale=%.2f w_swing=%.0f mpc_period=%.3f schedule=%d nom_x=%.4f\n",
+                cparams.kp_scale_wbc, cparams.wbc.w_swing, cparams.mpc_period,
+                cparams.use_gait_schedule ? 1 : 0, cparams.nominal_x);
     MpcWbcController controller(cparams);
     MpcWorkerThread mpc_worker(&controller, cparams.mpc_period);
     std::printf("[s8] 站立：基座高度=%.4f m，质心高度=%.4f m\n", controller.stand_base_height(),
