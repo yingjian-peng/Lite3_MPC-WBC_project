@@ -4,6 +4,11 @@ __pycache__/
 *.pyc
 *.zip
 .vscode
+# 参考工程（legged_control, 111 MB）：只作算法对照用，不在本仓库维护。
+# 原来的 `.legged_control` 带了前导点，与实际目录名 `legged_control` 不匹配，等于没忽略。
+/legged_control/
+# WBC 单测导出的 MuJoCo 复核用例（生成物）
+wbc_mujoco_cases.csv
 
 
 support/third_party/libtorch

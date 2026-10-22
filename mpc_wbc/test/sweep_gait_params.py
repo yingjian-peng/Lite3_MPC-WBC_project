@@ -220,7 +220,8 @@ def main():
         help="稳态窗跳过的过渡时间 [s]；长周期段建议 >= 2T",
     )
     ap.add_argument("--outdir", required=True)
-    ap.add_argument("--python", default="/tmp/lite3_venv/bin/python")
+    # 同 run_s8_case.py：默认用当前解释器，不写死 /tmp 下的虚拟环境路径。
+    ap.add_argument("--python", default=sys.executable)
     ap.add_argument(
         "--vmax",
         type=float,

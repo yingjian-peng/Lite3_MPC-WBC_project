@@ -58,9 +58,13 @@ constexpr int kWbcNTauRows = 2 * kNumJoints;            // 24
 constexpr int kWbcNGe = kWbcNConeRows + kWbcNCapRows + kWbcNTauRows;
 
 struct WbcParams {
-    // 任务权重
-    double w_base = 1.0e3;   // 基座 6D 加速度任务
-    double w_swing = 1.0e2;  // 摆动足任务空间 PD
+    // 任务权重。
+    // **量级参考 legged_control（go1）：swingLeg=100、baseAccel=1、contactForce=0.01**，
+    // 即摆动足任务的优先级远高于基座加速度任务。旧默认（base=1e3、swing=1e2）恰好
+    // 反过来（基座压摆动 10 倍），实测摆动足净空只有命令值的 25%、FL/HR 有 85–90%
+    // 的摆动时间拖地。
+    double w_base = 1.0;     // 基座 6D 加速度任务
+    double w_swing = 100.0;  // 摆动足任务空间 PD
     // MPC 逐脚力跟踪权重（**默认 0 = 关闭**）。docs/04 把它列为软任务 ①，但它与基座加速度
     // 任务直接竞争：参考工程实测「强跟踪会把平衡（基座任务）拉偏」，最终也把它去掉了。
     // 需要时（例如想让 WBC 尽量复现 MPC 的分配）显式打开，并注意基座跟踪误差会变大。
@@ -75,9 +79,9 @@ struct WbcParams {
     // 基座任务从 q̈_x=0.5 拉到 0.4999869（误差 1.3e-5，w_tau=0 时 4.2e-9），因为「跟准基座」
     // 与「省力矩」在同一组接触力/力矩上折中；参考工程实测它还会造成承力甩锅与静立缓漂。
     double w_tau = 0.0;
-    // 任务增益
-    double kp_swing = 200.0;
-    double kd_swing = 10.0;
+    // 任务增益（参考 legged_control go1：kp=350、kd=37，kd/kp≈0.106 近似临界阻尼）
+    double kp_swing = 350.0;
+    double kd_swing = 37.0;
     double kp_posture = 25.0;
     double kd_posture = 2.0;
     // 物理与限幅
@@ -129,7 +133,7 @@ struct WbcOutput {
     double cone_violation = 0.0;    // 摩擦锥最大违反（>0 即违反）
     double tau_abs_max = 0.0;       // 最大关节力矩绝对值
     double base_accel_error = 0.0;  // ‖q̈[0:6] − [a_des; α_des]‖∞
-    double swing_accel_error = 0.0; // 摆动足任务残差 ‖Jc q̈ − b_task‖∞
+    double swing_accel_error = 0.0; // 摆动软任务残差 ‖Jc q̈ − b_task‖∞（b_task 含 −J̇q̇，与 QP 一致）
 
     int iters = 0;
     double qp_gap = 0.0;
@@ -292,7 +296,10 @@ public:
             if (in.stance[leg]) continue;
             const Vec3d err = in.foot_des_world[leg] - in.foot_pos_world[leg];
             const Vec3d edot = in.foot_vel_des_world[leg] - in.foot_vel_world[leg];
-            Vec3d target = p.kp_swing * err + p.kd_swing * edot;
+            // 必须与 BuildQp ② 的 b 完全相同（含 `− J̇q̇` 与同一限幅），否则这里量的不是
+            // QP 真正在最小化的那个残差：漏掉 J̇q̇ 时即使 w_swing 扫 5 个数量级残差也只
+            // 降 1.4×（因为剩下的全是 J̇q̇ 本身），看起来像「权重不起作用」。
+            Vec3d target = p.kp_swing * err + p.kd_swing * edot - Jdotv.segment<3>(3 * leg);
             for (int c = 0; c < 3; ++c)
                 target(c) = std::min(std::max(target(c), -p.contact_accel_max), p.contact_accel_max);
             const Vec3d acc = Jc.block<3, kWbcQdd>(3 * leg, 0) * out.qdd;
@@ -393,14 +400,18 @@ public:
             b << in.a_des_world, in.alpha_des_body;
             add_task(A, b, p.w_base);
         }
-        // ② 摆动足任务空间 PD：Jc q̈ = kp(p_des − p) + kd(v_des − v)
+        // ② 摆动足任务空间 PD：J q̈ = kp(p_des − p) + kd(v_des − v) − J̇q̇
+        // 最后一项必须有：左脚加速度是 a = J q̈ + J̇q̇，漏掉 J̇q̇ 会让任务目标偏
+        // 一个与向心/科氏同量级的量（摆动腿关节速度 5 rad/s、力臂 0.2 m 时约
+        // 5 m/s²，与 kp·err 同量级），表现为摆动足跟不上、净空只有命令值的 25%。
+        // 参考工程 legged_control 的 formulateSwingLegTask 同样减了 dj*v。
         for (int leg = 0; leg < kNumLegs; ++leg) {
             if (in.stance[leg]) continue;
             Eigen::MatrixXd A = Eigen::MatrixXd::Zero(3, kWbcNvar);
             A.block<3, kWbcQdd>(0, 0) = Jc.block<3, kWbcQdd>(3 * leg, 0);
             const Vec3d err = in.foot_des_world[leg] - in.foot_pos_world[leg];
             const Vec3d edot = in.foot_vel_des_world[leg] - in.foot_vel_world[leg];
-            Vec3d b = p.kp_swing * err + p.kd_swing * edot;
+            Vec3d b = p.kp_swing * err + p.kd_swing * edot - Jdotv.segment<3>(3 * leg);
             for (int c = 0; c < 3; ++c)  // 限幅，防大误差时任务目标爆冲
                 b(c) = std::min(std::max(b(c), -p.contact_accel_max), p.contact_accel_max);
             add_task(A, b, p.w_swing);

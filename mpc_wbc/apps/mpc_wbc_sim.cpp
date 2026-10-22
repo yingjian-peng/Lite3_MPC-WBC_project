@@ -167,12 +167,17 @@ int main(int argc, char** argv) {
     dcsv.flush();
 
     double cmd_scale = 1.0;   // 命令缩放（A/B 用）
+    // 只缩放前向速度：把 vx 推到 docs/00 的 0.60 m/s 上限时，vy/ωz 仍需留在包线内，
+    // 否则 turn 段的 ωz 会被一并放大到 1.2 rad/s（超 0.50 上限），失稳原因就不再是 vx。
+    double vx_scale = 1.0;
     MpcWbcControllerParams cparams;
     if (const char* e = std::getenv("S8_PD_SCALE")) cparams.kp_scale_wbc = cparams.kd_scale_wbc = std::atof(e);
+    if (const char* e = std::getenv("S8_DQ_FF")) cparams.swing_joint_vel_ff = (std::atoi(e) != 0);
     if (const char* e = std::getenv("S8_W_SWING")) cparams.wbc.w_swing = std::atof(e);
     if (const char* e = std::getenv("S8_MPC_PERIOD")) cparams.mpc_period = std::atof(e);
     if (const char* e = std::getenv("S8_HYST")) cparams.wbc_enable_hold_frames = std::atoi(e);
     if (const char* e = std::getenv("S8_CMD_SCALE")) cmd_scale = std::atof(e);
+    if (const char* e = std::getenv("S8_VX_SCALE")) vx_scale = std::atof(e);
     // 步态 A/B：S8_GAIT_SCHEDULE=0 关掉三段式调度，退回单一 GaitParams（旧行为）
     if (const char* e = std::getenv("S8_GAIT_SCHEDULE")) cparams.use_gait_schedule = std::atoi(e) != 0;
     if (const char* e = std::getenv("S8_GAIT_PERIOD")) cparams.gait.period = std::atof(e);
@@ -183,6 +188,17 @@ int main(int argc, char** argv) {
     // 实测摆动净空只有目标的 ~25%（FL/HR 有 85–90% 的摆动时间在拖地），优先调 PD 增益。
     if (const char* e = std::getenv("S8_KP_SWING")) cparams.wbc.kp_swing = std::atof(e);
     if (const char* e = std::getenv("S8_KD_SWING")) cparams.wbc.kd_swing = std::atof(e);
+    // SRBD-MPC 权重：默认 q_p_xy=10 相对 q_p_z=200 软了两个数量级（参考工程 legged_control 的
+    // go1 配置是 p_com_xy=1000 / p_com_z=1500，几乎同量级），会导致制动段 MPC 放弃水平回正、
+    // 把力气全灌进刚性的竖直通道，形成极限环。这些 env 用于扫这个配比。
+    if (const char* e = std::getenv("S8_Q_PXY")) cparams.mpc.q_p_xy = std::atof(e);
+    if (const char* e = std::getenv("S8_Q_PZ")) cparams.mpc.q_p_z = std::atof(e);
+    if (const char* e = std::getenv("S8_Q_VXY")) cparams.mpc.q_v_xy = std::atof(e);
+    if (const char* e = std::getenv("S8_Q_VZ")) cparams.mpc.q_v_z = std::atof(e);
+    if (const char* e = std::getenv("S8_Q_RP")) cparams.mpc.q_rp = std::atof(e);
+    if (const char* e = std::getenv("S8_Q_YAW")) cparams.mpc.q_yaw = std::atof(e);
+    if (const char* e = std::getenv("S8_FZ_MAX")) cparams.mpc.foot_force_max = std::atof(e);
+    if (const char* e = std::getenv("S8_R_LAMBDA")) cparams.mpc.r_lambda = std::atof(e);
     std::printf("[s8] pd_scale=%.2f w_swing=%.0f mpc_period=%.3f schedule=%d nom_x=%.4f\n",
                 cparams.kp_scale_wbc, cparams.wbc.w_swing, cparams.mpc_period,
                 cparams.use_gait_schedule ? 1 : 0, cparams.nominal_x);
@@ -324,7 +340,7 @@ int main(int argc, char** argv) {
             in.q = q_meas;
             in.dq = dq_meas;
             in.cmd = phases[idx].cmd;
-            in.cmd.vx *= cmd_scale;
+            in.cmd.vx *= cmd_scale * vx_scale;
             in.cmd.vy *= cmd_scale;
             in.cmd.wz *= cmd_scale;
             // 1 kHz 路径：只打包 MPC 请求（不求解）→ 读最近一次 wrench → 算命令

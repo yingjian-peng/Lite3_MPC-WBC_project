@@ -31,10 +31,16 @@ struct EstimatorParams {
     double support_vel_tol = 0.30;         // 支撑腿零速候选的残差阈值 [m/s]
     double max_dt = 0.05;                  // 超过则视为丢包，标记无效 [s]
     double height_filter_tau = 0.0;        // >0 时对高度做一阶低通 [s]
-    // 跳变门限 [m/s^2]：单帧速度估计变化超过 max_accel*dt 时，判定为触地/离地
-    // 瞬间的伪接触（足还在动但被标记为支撑），本帧不更新速度。
+    // 跳变门限 [m/s^2]：单帧速度估计的变化量被限幅到 max_accel*dt 以内。
     // 依据：真实机身加速度在 LITE3 包线内不超过 ~25 m/s^2（45 N 侧推约 25），
     // 而伪接触尖峰在 10 ms 采样下可达 35–45 m/s^2。
+    //
+    // 2026-10-21 修正：原来超限时是「丢掉本帧、保留冻结的旧估计」。这在闭环里会**永久
+    // 自锁** —— 一旦真值跑出「冻结值 ± max_accel·dt」，之后每一帧的新候选都必然超限，
+    // 于是估计器永远停在旧值上。R6 行走实测：指令 0.15 m/s、估计值冻在 0.091 m/s、
+    // 真值已经到 0.86 m/s，MPC 因此持续给前向加速度（正反馈）→ 制动段拖倒。
+    // 改成「限幅跟随」：伪尖峰只会让估计值偏移 max_accel·dt（可忽略且下一帧即恢复），
+    // 真实快速加减速则能紧贴物理上限跟上，两种情形都不会锁死。
     double max_accel = 30.0;
 };
 
@@ -154,12 +160,16 @@ public:
         }
         state_.num_support = static_cast<int>(consistent.size());
 
-        // ---- 跳变门限：拒绝触地/离地瞬间的伪接触尖峰 ----
+        // ---- 跳变门限：把触地/离地瞬间的伪接触尖峰限幅掉 ----
+        // 注意是**限幅**而不是**丢弃**：丢弃会让 state_.base_vel_w 冻住，而下一帧的新
+        // 候选与这个冻结值只会越差越远，于是每帧都超限、估计器永久停住（详见
+        // EstimatorParams::max_accel 的注释）。限幅则始终以物理加速度上限跟随真值。
         bool gate_rejected = false;
         if (initialized_ && vel_ok && dt > 0.0) {
             const Vec3d jump = base_vel - state_.base_vel_w;
-            if (jump.norm() > params_.max_accel * dt) {
-                base_vel = state_.base_vel_w;
+            const double max_jump = params_.max_accel * dt;
+            if (jump.norm() > max_jump) {
+                base_vel = state_.base_vel_w + jump.normalized() * max_jump;
                 gate_rejected = true;
             }
         }

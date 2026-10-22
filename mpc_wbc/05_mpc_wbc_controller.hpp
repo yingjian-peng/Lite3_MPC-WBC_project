@@ -73,8 +73,28 @@ struct MpcWbcControllerParams {
     // ---- 低层 PD ----
     double kp_pos = 100.0;           // 位置环档位（docs/03 附录 C）
     double kd_pos = 2.5;
-    double kp_scale_wbc = 0.5;       // WBC 工作时的 PD 缩放（参考工程推荐 1 kHz WBC + 0.4~0.5）
-    double kd_scale_wbc = 0.5;
+    // WBC 工作时的 PD 缩放。**必须保持 1.0**：低层 PD 是内环，WBC 通过 τ_ff 只负责把总力矩
+    // 拉到 τ_wbc，两者职责正交，把内环打折只会让关节跟踪变差。
+    //
+    // 历史：原值 0.5（理由写的是「参考工程推荐 1 kHz WBC + 0.4~0.5」），但 legged_control
+    // 实际上直接用 task.info 里的整档 kp/kd，从不打折。实测打折的代价：
+    //   0.45 m/s 关节跟踪误差漂到 0.1–0.3 rad → τ_ff = τ_wbc − pd 常年顶在 ±30 N·m 上限
+    //   （饱和率 44%），踩不到 30 时又反过来推翻长驱力矩。
+    // 2026-10-21 扫描（0.45 m/s，S8_CMD_SCALE=3.0）：
+    //   scale=0.25 → 12.9 s 失稳；0.35 → 9.0 s 失稳；0.5 → 12.9 s 失稳；**1.0 → 全程通过**
+    // 换成 1.0 后 0.15 / 0.30 / 0.45 / 0.60 m/s 全部 rc=0（0.75 超 docs/00 包线，仍失效）。
+    double kp_scale_wbc = 1.0;
+    double kd_scale_wbc = 1.0;
+    // 是否把步态的期望足端速度用腿雅可比反解成期望关节速度（喂给 PD 的 kd 项与执行器前馈）。
+    // true ：PD 的 kd 项量的是「真实关节速度相对**计划**关节速度」的偏差。
+    // false：dq_des 恒为 0，kd 项退化为标准的速度阻尼 −kd·dq（与 S4 开环基线/站立环一致）。
+    //
+    // 2026-10-21 A/B（0.45 m/s，kp_scale=1.0，两者都 rc=0）—— 实测**没有可测收益**，故默认 false：
+    //   DQ_FF=0：forward 2.87° / turn 9.21° / stop4 17.0°，τ_ff 饱和 15–66%
+    //   DQ_FF=1：forward 5.20° / turn 6.26° / stop4 12.4°，τ_ff 饱和 32–59%
+    // 混合结果、互有胜负；且 true 时 τ_ff 饱和率整体更高（因为步态给的 foot_vel 是**平均速度**，
+    // 与真实关节速度并不逐帧匹配，反而放大了 kd 项）。保留开关供后续换更准的参考轨迹时复验。
+    bool swing_joint_vel_ff = false;
     // ---- 安全 ----
     double tilt_limit = 0.8;         // roll/pitch 超限 → 故障（rad）
     double wbc_enable_tilt = 0.35;   // 姿态超过该值不允许使能 WBC（rad）
@@ -504,12 +524,25 @@ private:
         if (ramping) {
             const double s = SmoothStep01(rel / std::max(1e-6, p.stand_ramp_time));
             q_des_ = (1.0 - s) * q_start_ + s * p.stand_q;
+            dq_des_.setZero();  // 斜坡段的关节速度不参与前馈，显式清零防旧值残留
         } else {
             for (int leg = 0; leg < kNumLegs; ++leg) {
                 Vec3d seed = q_des_.segment<3>(3 * leg);
-                Vec3d q_leg;
+                Vec3d q_leg = seed;
                 if (model_.InverseKinematics(leg, legs[leg].foot_pos, &q_leg, &seed))
                     q_des_.segment<3>(3 * leg) = q_leg;
+                // 期望关节速度：v_foot^B = J_leg·dq  ⇒  dq_des = J_leg⁻¹·v_foot_des^B
+                // 是否启用由 swing_joint_vel_ff 控制（env S8_DQ_FF）。默认关闭，A/B 结论见参数注释。
+                if (p.swing_joint_vel_ff) {
+                    const Mat3d J_leg = model_.LegJacobianBody(leg, q_leg);
+                    Eigen::FullPivLU<Mat3d> lu(J_leg);
+                    if (lu.isInvertible())
+                        dq_des_.segment<3>(3 * leg) = lu.solve(legs[leg].foot_vel);
+                    else
+                        dq_des_.segment<3>(3 * leg).setZero();
+                } else {
+                    dq_des_.segment<3>(3 * leg).setZero();
+                }
             }
         }
         ClipToJointLimits(&q_des_);
@@ -669,7 +702,7 @@ private:
         out.joint_cmd.col(0).setConstant(kp);
         out.joint_cmd.col(1) = q_des_.cast<float>();
         out.joint_cmd.col(2).setConstant(kd);
-        out.joint_cmd.col(3) = dq_des_.cast<float>();  // 期望关节速度（站立/步态均为 0）
+        out.joint_cmd.col(3) = dq_des_.cast<float>();  // 期望关节速度（步态足端速度反解，站立为 0）
         for (int j = 0; j < 12; ++j) {
             const double pd = kp * (q_des_(j) - in.q(j)) + kd * (dq_des_(j) - in.dq(j));
             out.tau_pd(j) = pd;
@@ -678,8 +711,15 @@ private:
             // （实测：起立段 τ_ff=−pd 被 ±30 夹住后总力矩多出 −30 N·m，机器人被推翻）。
             double tau_ff = 0.0;
             if (wbc_active_) {
+                // 注：曾经试过去掉下面这次夹取（理由：执行器端只对总力矩限幅，而 τ_wbc 已被
+                // WBC 约束在 ±tau_max 内，理论上不夹时长驱力矩恰等于 τ_wbc）。实测反而更差：
+                // 0.45 m/s 下 τ_ff 峰值从 30 涨到 60 N·m，walk 段 6.5 s 就倾到 13.6°、8.0 s 失稳
+                // （带夹取时能撑到 12.9 s）。原因是 pd 项本身就有 5–16 N·m（kp=50 下对应
+                // 0.1–0.3 rad 的关节跟踪误差），τ_ff = τ_wbc − pd 的绝对值因此经常超 30；
+                // 放开夹取等于把这个 PD 失配整包灌进前馈，反而放大扰动。
+                // 结论：τ_ff 顶限是「关节跟踪不足」的**症状**而非独立 bug，应从 kp/kd 与参考
+                // 轨迹的激进度上治（见 docs/05 的 PD 增益扫描），此处保留夹取。
                 tau_ff = out.tau_wbc(j) - pd;
-                // 总力矩由 WBC 约束保证在 ±tau_max 内；这里再夹一次前馈，防 PD 项瞬态把前馈顶爆
                 tau_ff = std::max(-p.wbc.tau_max, std::min(p.wbc.tau_max, tau_ff));
             }
             out.joint_cmd(j, 4) = static_cast<float>(tau_ff);

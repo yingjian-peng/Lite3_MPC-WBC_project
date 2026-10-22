@@ -31,7 +31,9 @@ def main():
                     help="仿真时长 [s]；0 表示自动（起立 4.8 s + 场景时长 + 20 s 余量）")
     ap.add_argument("--sim-env", action="append", default=[], help="仿真侧环境变量 K=V")
     ap.add_argument("--env", action="append", default=[], help="控制器侧环境变量 K=V")
-    ap.add_argument("--python", default="/tmp/lite3_venv/bin/python")
+    # 默认用跑本脚本的解释器（即激活的虚拟环境），不再写死 /tmp/lite3_venv —— 那个目录
+    # 在 /tmp 被清理/重启后就没了，会让整个 S8 用例报告「找不到 python」。
+    ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--sim-log-every", default="10")
     args = ap.parse_args()
 
