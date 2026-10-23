@@ -173,21 +173,55 @@ int main(int argc, char** argv) {
     double vx_scale = 1.0;
     MpcWbcControllerParams cparams;
     if (const char* e = std::getenv("S8_PD_SCALE")) cparams.kp_scale_wbc = cparams.kd_scale_wbc = std::atof(e);
+    if (const char* e = std::getenv("S8_PD_EXTRA")) cparams.pd_extra = std::atof(e);
+    if (const char* e = std::getenv("S8_PD_EXTRA_ALL")) cparams.pd_extra_stance_only = (std::atoi(e) == 0);
     if (const char* e = std::getenv("S8_DQ_FF")) cparams.swing_joint_vel_ff = (std::atoi(e) != 0);
     if (const char* e = std::getenv("S8_W_SWING")) cparams.wbc.w_swing = std::atof(e);
     // 支撑腿姿势正则：权重量级参考摆动任务（w_swing=100），但它是零空间填充项、
     // 只要求与基座任务（w_base=1）同量级或更小。
     if (const char* e = std::getenv("S8_W_POSTURE_ST"))
         cparams.wbc.w_posture_stance = std::atof(e);
+    // 支撑足速度阻尼（接触行 Jc·q̈ = −J̇q̇ − kv·v_foot）：0 = 旧行为
+    if (const char* e = std::getenv("S8_KV_STANCE")) cparams.wbc.kv_stance_vel = std::atof(e);
+    // 支撑足位置/速度反馈（接触等式右端项），0 = 旧行为
+    if (const char* e = std::getenv("S8_KP_STANCE_POS")) cparams.wbc.kp_stance_pos = std::atof(e);
+    if (const char* e = std::getenv("S8_KD_STANCE_POS")) cparams.wbc.kd_stance_pos = std::atof(e);
     if (const char* e = std::getenv("S8_MPC_PERIOD")) cparams.mpc_period = std::atof(e);
     if (const char* e = std::getenv("S8_HYST")) cparams.wbc_enable_hold_frames = std::atoi(e);
     if (const char* e = std::getenv("S8_CMD_SCALE")) cmd_scale = std::atof(e);
+    // 命令平滑：一阶低通时间常数与变化率上限（默认 0.25 s / 0.8 m/s² / 2.0 rad/s²）
+    if (const char* e = std::getenv("S8_CMD_TAU")) cparams.cmd_tau = std::atof(e);
+    if (const char* e = std::getenv("S8_CMD_SLEW_V")) cparams.cmd_slew_v = std::atof(e);
+    if (const char* e = std::getenv("S8_CMD_SLEW_W")) cparams.cmd_slew_w = std::atof(e);
+    // 三轴组合归一化（docs/00 §2.2）：sqrt(vx²+vy²) + ratio·|wz| ≤ max，超限同比缩比
+    if (const char* e = std::getenv("S8_COMBO_MAX")) cparams.combo_max = std::atof(e);
+    if (const char* e = std::getenv("S8_COMBO_WZ")) cparams.combo_wz_ratio = std::atof(e);
+    // 转向-平移摩擦竞争守卫：Δv ≈ gain·vxy·ωz² ≤ loss（loss<=0 关闭）
+    if (const char* e = std::getenv("S8_COMBO_GAIN")) cparams.combo_turn_gain = std::atof(e);
+    if (const char* e = std::getenv("S8_COMBO_LOSS")) cparams.combo_turn_loss = std::atof(e);
+    // 单轴硬上限（命令级钳位）；S8_CMDMAX_V/W/Y 覆盖，<=0 关闭
+    if (const char* e = std::getenv("S8_CMDMAX_VX")) cparams.cmd_max_vx = std::atof(e);
+    if (const char* e = std::getenv("S8_CMDMAX_VY")) cparams.cmd_max_vy = std::atof(e);
+    if (const char* e = std::getenv("S8_CMDMAX_WZ")) cparams.cmd_max_wz = std::atof(e);
+    // 超限分配策略：0=同比缩比(默认) 1=转向优先 2=平移优先
+    if (const char* e = std::getenv("S8_COMBO_PRIORITY"))
+        cparams.combo_priority = std::atoi(e);
     if (const char* e = std::getenv("S8_VX_SCALE")) vx_scale = std::atof(e);
     // 步态 A/B：S8_GAIT_SCHEDULE=0 关掉三段式调度，退回单一 GaitParams（旧行为）
     if (const char* e = std::getenv("S8_GAIT_SCHEDULE")) cparams.use_gait_schedule = std::atoi(e) != 0;
     if (const char* e = std::getenv("S8_GAIT_PERIOD")) cparams.gait.period = std::atof(e);
     if (const char* e = std::getenv("S8_GAIT_DUTY")) cparams.gait.duty = std::atof(e);
     if (const char* e = std::getenv("S8_GAIT_SWING")) cparams.gait.swing_height = std::atof(e);
+    if (const char* e = std::getenv("S8_STOP_RAMP_PERIODS"))
+        cparams.gait.stop_ramp_periods = std::atof(e);
+    // 腿序相位偏移（FL,FR,HL,HR）。默认 0,0.5,0.5,0 = 对角小跑；
+    // 0,0.5,0.75,0.25 + duty≥0.75 = 四足爬行（任意时刻只有一条腿摆动，静稳定）。
+    if (const char* e = std::getenv("S8_PHASE_OFFSETS")) {
+        double v[4] = {0.0, 0.5, 0.5, 0.0};
+        if (std::sscanf(e, "%lf,%lf,%lf,%lf", &v[0], &v[1], &v[2], &v[3]) == 4)
+            for (int i = 0; i < 4; ++i) cparams.gait.phase_offset[i] = v[i];
+    }
+    if (const char* e = std::getenv("S8_W_BASE")) cparams.wbc.w_base = std::atof(e);
     // 分段调度的**闭环专用**抬腿高度覆盖。不动 SegmentedGaitParams::Baseline() 是因为
     // 那份参数与开环位置环共用（docs/00 §3、openloop-baseline-v1），改了会破坏 A/B 可比性。
     //
@@ -197,6 +231,12 @@ int main(int argc, char** argv) {
     //   swing_height=0.10 → 3/3 次通过
     // 开环位置环能靠关节跟踪滞后"吃掉"一部分净空（实际抬脚只有 3–5 cm 也还能走），
     // 而 MPC+WBC 的摆动任务是足端加速度级、跟踪更紧，0.07 m 的命令在 0.60 m/s 下不够。
+    // 步态级速度/偏航率反馈（只改足端步幅，不改 MPC 参考）
+    if (const char* e = std::getenv("S8_GAIT_VFB")) cparams.gait_vel_fb = std::atof(e);
+    if (const char* e = std::getenv("S8_GAIT_WFB")) cparams.gait_yaw_fb = std::atof(e);
+    if (const char* e = std::getenv("S8_GAIT_VTRIM")) cparams.gait_vel_trim = std::atof(e);
+    if (const char* e = std::getenv("S8_MPC_VTRIM")) cparams.mpc_vel_trim = std::atof(e);
+    if (const char* e = std::getenv("S8_CMD_VTRIM")) cparams.cmd_vel_trim = std::atof(e);
     if (const char* e = std::getenv("S8_SWING_LOW"))
         cparams.gait_schedule.low.swing_height = std::atof(e);
     if (const char* e = std::getenv("S8_SWING_MID"))
@@ -217,11 +257,17 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("S8_Q_VZ")) cparams.mpc.q_v_z = std::atof(e);
     if (const char* e = std::getenv("S8_Q_RP")) cparams.mpc.q_rp = std::atof(e);
     if (const char* e = std::getenv("S8_Q_YAW")) cparams.mpc.q_yaw = std::atof(e);
+    if (const char* e = std::getenv("S8_Q_WYAW")) cparams.mpc.q_w_yaw = std::atof(e);
+    if (const char* e = std::getenv("S8_Q_WRP")) cparams.mpc.q_w_rp = std::atof(e);
     if (const char* e = std::getenv("S8_FZ_MAX")) cparams.mpc.foot_force_max = std::atof(e);
     if (const char* e = std::getenv("S8_R_LAMBDA")) cparams.mpc.r_lambda = std::atof(e);
-    std::printf("[s8] pd_scale=%.2f w_swing=%.0f mpc_period=%.3f schedule=%d nom_x=%.4f\n",
-                cparams.kp_scale_wbc, cparams.wbc.w_swing, cparams.mpc_period,
-                cparams.use_gait_schedule ? 1 : 0, cparams.nominal_x);
+    std::printf("[s8] pd_scale=%.2f w_swing=%.0f w_base=%.2f mpc_period=%.3f schedule=%d nom_x=%.4f "
+                "kv_stance=%.1f offsets=%.2f/%.2f/%.2f/%.2f\n",
+                cparams.kp_scale_wbc, cparams.wbc.w_swing, cparams.wbc.w_base,
+                cparams.mpc_period, cparams.use_gait_schedule ? 1 : 0, cparams.nominal_x,
+                cparams.wbc.kv_stance_vel, cparams.gait.phase_offset[0],
+                cparams.gait.phase_offset[1], cparams.gait.phase_offset[2],
+                cparams.gait.phase_offset[3]);
     MpcWbcController controller(cparams);
     MpcWorkerThread mpc_worker(&controller, cparams.mpc_period);
     std::printf("[s8] 站立：基座高度=%.4f m，质心高度=%.4f m\n", controller.stand_base_height(),

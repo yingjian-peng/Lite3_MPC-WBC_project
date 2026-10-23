@@ -112,6 +112,26 @@ struct WbcParams {
     double foot_force_max = 200.0;   // 单脚法向力上限 N（≤0 关闭该约束）
     double gravity = 9.81;           // 重力加速度（沿世界系 −z）；接入 S8 时与仿真/真机统一
     double contact_accel_max = 200.0;  // 接触加速度目标限幅（防任务 PD 爆冲）[m/s²]
+    // 支撑足**速度**阻尼 [1/s]。默认 0 = 只约束足端加速度为零（旧行为）。
+    //
+    // 旧行为只保证「足端加速度 = 0」，**不消除已存在的足端速度**：摆动足落地瞬间仍有
+    // 水平速度，落地后这速度会一直保留（接触行只是让它不再变化），于是整条支撑相都在
+    // 相对地面滑移。实测单轴线速度因此系统性偏快一个常量（vx 0.15→0.204、
+    // 0.30→0.374、0.60→0.652），且与步幅无关——改步幅（反馈/前馈 trim）都改不动。
+    // 这里把接触行改成 Jc·q̈ = −J̇q̇ − kv·v_foot，让足端速度按 kv 指数衰减。
+    // 建议 5–15；太大会与摆动任务抢权，表现为落地冲击。
+    double kv_stance_vel = 0.0;
+    // 支撑足**位置**反馈 [1/s²] 与速度反馈 [1/s]（作用在接触等式右端项）：
+    //   Jc·q̈ = −J̇q̇ + kp·(p_des − p_now) + kd·(0 − v_foot)
+    // p_des 取步态给出的**机体系**期望足位（转到世界系时用同一个基座位置，所以
+    // 误差里不含基座位置估计的漂移）。
+    //
+    // 动机：原实现只约束足端加速度为零，支撑脚可以在整条支撑相里匀速滑移；而速度
+    // 估计器又假设支撑脚零速，于是「足端速度」永远看到 0、kv 阻尼失效。结果是机身比
+    // 规划多走（单轴实测恒快 0.05 m/s，且改步幅/改 MPC 参考都改不动）。加上位置项后
+    // 腿被钉在规划的机体系足位上，机身必须按规划前进。建议 kp=200、kd=30。
+    double kp_stance_pos = 0.0;
+    double kd_stance_pos = 0.0;
     double reg = 1e-8;               // Hessian 正则（保证 KKT 可解）
     QpIpmOptions qp;                 // 内点法选项
     double max_solution_age = 0.01;  // 求解失败后沿用旧解的最长时间 [s]
@@ -129,6 +149,9 @@ struct WbcInput {
     // 摆动足目标（支撑腿忽略）
     std::array<Vec3d, kNumLegs> foot_des_world{};
     std::array<Vec3d, kNumLegs> foot_vel_des_world{};
+    // 支撑足的**期望世界位置**（由机体系期望足位 + 基座位置/偏航换算），供
+    // `kp_stance_pos` / `kd_stance_pos` 的接触位置反馈使用。
+    std::array<Vec3d, kNumLegs> foot_pos_des_world{};
 
     // 基座期望加速度（来自 SRBD-MPC，见 ComputeBaseAccelDesired）
     Vec3d a_des_world = Vec3d::Zero();
@@ -299,7 +322,10 @@ public:
             if (in.stance[leg]) {
                 const Vec3d acc = Jc.block<3, kWbcQdd>(3 * leg, 0) * out.qdd +
                                   Jdotv.segment<3>(3 * leg);
-                contact_res = std::max(contact_res, acc.cwiseAbs().maxCoeff());
+                const Vec3d target =
+                    StanceAccelTarget(in, p, Jdotv.segment<3>(3 * leg), leg) -
+                    p.kv_stance_vel * (in.foot_vel_world[leg] - in.foot_vel_des_world[leg]);
+                contact_res = std::max(contact_res, (acc - target).cwiseAbs().maxCoeff());
                 const double viol[5] = {-f.z(),        f.x() - p.mu * f.z(), -f.x() - p.mu * f.z(),
                                         f.y() - p.mu * f.z(), -f.y() - p.mu * f.z()};
                 for (double v : viol) cone_viol = std::max(cone_viol, v);
@@ -358,7 +384,9 @@ public:
             const int r = kWbcQdd + 3 * leg;
             if (in.stance[leg]) {
                 A_eq.block<3, kWbcQdd>(r, 0) = Jc.block<3, kWbcQdd>(3 * leg, 0);
-                b_eq.segment<3>(r) = -Jdotv.segment<3>(3 * leg);
+                b_eq.segment<3>(r) =
+                    StanceAccelTarget(in, p, Jdotv.segment<3>(3 * leg), leg) -
+                    p.kv_stance_vel * (in.foot_vel_world[leg] - in.foot_vel_des_world[leg]);
             } else {
                 A_eq.block<3, 3>(r, kWbcQdd + 3 * leg).setIdentity();
             }
@@ -492,6 +520,26 @@ public:
     void set_warm_start_enabled(bool en) { warm_start_ = en; }
 
 private:
+    /// 支撑腿接触等式的右端项：−J̇q̇ + 位置/速度反馈（默认反馈增益为 0 → 旧行为）。
+    /// 诊断（contact_residual）与 QP 组装共用，保证量的就是 QP 在解的那个约束。
+    ///
+    /// 注意速度项减的是 `foot_vel_des_world`（**规划**足端速度）而不是零：原地转向时
+    /// 支撑足必须沿 ω×r 的圆弧滑动，若把它阻尼到零，就等于持续给机身一个反向水平力
+    /// （力臂 0.34 m），这正是转向时滚转/俯仰「涡动」的源头。
+    static Vec3d StanceAccelTarget(const WbcInput& in, const WbcParams& p,
+                                   const Vec3d& jdotv, int leg) {
+        Vec3d b = -jdotv;
+        if (p.kp_stance_pos != 0.0 || p.kd_stance_pos != 0.0) {
+            Vec3d fb = p.kp_stance_pos * (in.foot_pos_des_world[leg] - in.foot_pos_world[leg]) +
+                       p.kd_stance_pos *
+                           (in.foot_vel_des_world[leg] - in.foot_vel_world[leg]);
+            for (int c = 0; c < 3; ++c)
+                fb(c) = std::min(std::max(fb(c), -p.contact_accel_max), p.contact_accel_max);
+            b += fb;
+        }
+        return b;
+    }
+
     static double ElapsedMs(const std::chrono::steady_clock::time_point& t0) {
         const auto t1 = std::chrono::steady_clock::now();
         return std::chrono::duration<double, std::milli>(t1 - t0).count();

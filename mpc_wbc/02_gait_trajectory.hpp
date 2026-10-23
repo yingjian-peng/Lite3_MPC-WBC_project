@@ -48,6 +48,9 @@ struct GaitParams {
 
     // 相位偏移，顺序 FL, FR, HL, HR（对角小跑）
     std::array<double, kNumLegs> phase_offset = {{0.0, 0.5, 0.5, 0.0}};
+    // 软停步的收步斜坡长度（单位：步态周期数）。1 = 一个周期内把步幅收到 0（默认）。
+    // 转向后停步时侧倾偏大，可试 2–3 让减速更缓（代价是停步时长变长）。
+    double stop_ramp_periods = 1.0;
 };
 
 /// 机体系速度命令。
@@ -67,8 +70,15 @@ struct SegmentedGaitParams {
 
     // 全局归一化上限（只用于判定主运动方向，不改变命令单位）。
     double max_vx = 0.60;  // m/s
-    double max_vy = 0.35;  // m/s
-    double max_wz = 0.50;  // rad/s
+    // 2026-11-01：横移指标上调到 0.50 m/s（实测 0.50 倾角 6.4°、误差 0.027；0.70 跟踪到
+    // 阈值、0.80 倾角 >10°），同步由 0.35 -> 0.50。同 max_wz，只影响主轴判定与
+    // `NormalizedSpeed`；`SelectAxis` 用的是物理量 |vy|，单轴行为不变。
+    double max_vy = 0.50;  // m/s
+    // 2026-11-01：转向指标上调到 1.00 rad/s（根因修复后实测 1.0 双向倾角 ≤3.3°、
+    // 失稳点 ≈2.5 rad/s），故这里同步由 0.50 -> 1.00。只影响「主轴判定」与
+    // `NormalizedSpeed`（起停滞回的归一化），纯转向的主轴判定不看这个值
+    // （`SelectAxis` 用的是物理量 |wz|），因此不改变已验证的单轴转向行为。
+    double max_wz = 1.00;  // rad/s
 
     // 主运动方向的分段边界（物理单位）。
     double vx_low_mid = 0.20;   // m/s
@@ -276,28 +286,76 @@ public:
     bool stepping() const { return stepping_; }
     double phase_start_time() const { return t_start_; }
 
+    /// 当前实际规划的步幅系数（1 = 满步幅，0 = 已收到零）。软停步期间 <1。
+    /// 上层（MPC 的速度/偏航参考）应当用同一个系数缩放，否则参考已经归零、而足端
+    /// 还在按满步幅扫，两者在停步瞬间相互对抗（实测停步段有 ~1 Hz 姿态振荡）。
+    double plan_scale() const { return (stepping_ && stopping_) ? stop_scale_ : 1.0; }
+
     /// 复位到静立（所有足在名义位置）。
     void Reset(double t) {
         stepping_ = false;
         t_start_ = t;
+        ResetStopLatch();
     }
 
     /// 每控制周期调用一次：更新行走/停步滞回状态并返回四腿目标。
-    std::array<LegGaitState, kNumLegs> Update(double t, const GaitCommand& cmd) {
-        if (schedule_ != nullptr) SetParamsAt(t, schedule_->Select(cmd));
+    /// `cmd_zero` 用**原始**（未平滑）命令判断是否请求停步：平滑后的命令按一阶低通
+    /// 衰减，若用它判断，0.3 rad/s 要 ~0.75 s 才落到停步阈值以下，再加上收步周期，
+    /// 2 s 的停步段根本走不完 → 实际一直在原地踏步（实测停步段侧倾 13°）。
+    std::array<LegGaitState, kNumLegs> Update(double t, const GaitCommand& cmd,
+                                              bool cmd_zero = false) {
+        // 停步期间**锁住步态参数**：命令一衰减，`Select()` 会把主方向判成低速段
+        // （T 0.44 → 1.20 s），把收步过程拉长到 ~1.8 s，2 s 的停步段根本走不完，
+        // 实测停步侧倾 13°。锁在请求停步那一刻的速度段即可。
+        if (cmd_zero && !stop_latched_) {
+            stop_params_ = params_;
+            stop_latched_ = true;
+        } else if (!cmd_zero) {
+            stop_latched_ = false;
+        }
+        if (schedule_ != nullptr)
+            SetParamsAt(t, stop_latched_ ? stop_params_ : schedule_->Select(cmd));
         const double ns = NormalizedSpeed(cmd);
         if (!stepping_) {
-            if (ns > params_.start_threshold) {
+            stopping_ = false;
+            stop_scale_ = 1.0;
+            // 注意：必须是「原始命令不为零」才重新起步。收步过程中平滑命令还残留
+            // 0.02–0.1（低通 0.25 s），只看平滑值会让步态在退出的下一帧立刻重新起步，
+            // 实测停步段出现 stand→walk→stand 抖动、侧倾 12°。
+            if (!cmd_zero && ns > params_.start_threshold) {
                 stepping_ = true;
                 t_start_ = t;  // θ=0 时四足均处于支撑相，可从静立平稳起走
             }
-        } else if (ns < params_.stop_threshold) {
-            // 软停步：命令已归零，但不立即退出步态。若中途退出，足端目标会从
-            // 当前相位位置瞬间拉回标称位（低速段步幅可达 0.17 m，实测倾角冲击
-            // 13°）。等相位刚过 θ=0 时四足同时处于支撑相且足端正好在标称位，
-            // 此时退出没有任何位置跳变。代价是多走完当前一步（≤1 个周期）。
+        } else if (!cmd_zero && ns >= params_.stop_threshold) {
+            // 命令恢复：取消停车过程（s 突变只影响后续目标速度，位置本身连续）。
+            stopping_ = false;
+            stop_scale_ = 1.0;
+        } else {
+            // 软停步（R11 修正）：原实现只等相位过 θ=0 就把步幅系数从 1 直接丢到 0，
+            // 而 θ=0 时支撑足在 `p0 + 0.5·Δp`、不是标称位，等于把四只脚的目标在一帧内
+            // 平移半个步幅（0.30 rad/s 转向时 3 cm），实测停步瞬间侧倾冲上 13°。
+            //
+            // 现在：请求停步后**先走到下一个相位边界**（θ=0，四足都在 p0±0.5Δp 的对称
+            // 位置），再用整整一个周期把水平步幅系数 s 从 1 线性收到 0，并在再下一个
+            // 边界退出。退出时四足目标恰为 p0、全部处于支撑相 → 无位置/速度跳变。
+            // 抬腿高度不缩放（s=0 时等价原地踏步，保证 MPC 接触计划与实际一致）。
+            const double T = std::max(1e-6, params_.period);
             const double theta = Wrap01((t - t_start_) / params_.period);
-            if (theta < 0.01) stepping_ = false;
+            if (!stopping_) {
+                if (theta < 0.01) {  // 对齐相位边界再开始收步
+                    stopping_ = true;
+                    t_stop_ = t;
+                }
+            }
+            if (stopping_) {
+                const double ramp = T * std::max(0.1, params_.stop_ramp_periods);
+                stop_scale_ = std::max(0.0, 1.0 - (t - t_stop_) / ramp);
+                if (stop_scale_ <= 0.0 && theta < 0.01) {
+                    stepping_ = false;
+                    stopping_ = false;
+                    stop_scale_ = 1.0;
+                }
+            }
         }
         return Evaluate(t, cmd);
     }
@@ -326,8 +384,10 @@ public:
 
             const Vec3d p0 = nominal_feet_.segment<3>(3 * leg);
             // 步长向量：Δp = T_stance·(v_cmd + ω×p0_xy)，只含水平分量。
-            const Vec3d dp(t_stance * (cmd.vx - cmd.wz * p0.y()),
-                           t_stance * (cmd.vy + cmd.wz * p0.x()),
+            // 停车过程中整体乘 `stop_scale_`（1 → 0），保证退出步态时足端已在 p0。
+            const double dp_scale = stopping_ ? stop_scale_ : 1.0;
+            const Vec3d dp(dp_scale * t_stance * (cmd.vx - cmd.wz * p0.y()),
+                           dp_scale * t_stance * (cmd.vy + cmd.wz * p0.x()),
                            0.0);
 
             if (st.contact) {
@@ -397,6 +457,18 @@ private:
     Vec12d nominal_feet_ = Vec12d::Zero();
     bool stepping_ = false;
     double t_start_ = 0.0;
+    // 软停步状态：stop_scale_ 为水平步幅系数（1 → 0），stopping_ 表示正在收步。
+    bool stopping_ = false;
+    double t_stop_ = 0.0;
+    double stop_scale_ = 1.0;
+    // 停步期间锁定的步态参数（防止命令衰减把主方向切到低速段、把收步拉长）。
+    bool stop_latched_ = false;
+    GaitParams stop_params_;
+    void ResetStopLatch() {
+        stopping_ = false;
+        stop_scale_ = 1.0;
+        stop_latched_ = false;
+    }
 };
 
 }  // namespace mpc_wbc

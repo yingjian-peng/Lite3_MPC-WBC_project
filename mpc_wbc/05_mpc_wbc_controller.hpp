@@ -66,6 +66,66 @@ struct MpcWbcControllerParams {
     double cmd_tau = 0.25;           // 一阶低通时间常数 [s]（0 = 关闭）
     double cmd_slew_v = 0.8;         // 速度命令变化率上限 [m/s²]（0 = 关闭）
     double cmd_slew_w = 2.0;         // 偏航命令变化率上限 [rad/s²]
+    // ---- 三轴组合约束（docs/00 §2.2）----
+    //   sqrt(vx²+vy²) + combo_wz_ratio·|wz| ≤ combo_max，超限时三轴同比例缩比。
+    // 这条约束在设计文档里一直有（0.18 / 0.67），但**代码里从未实现**。实测三轴同时给
+    // 满量程（vx 0.60 + vy 0.50 + wz 1.00 → s = 0.961）会让 MPC 打满、侧倾冲到 46.6°
+    // 直接翻车（`build/single_axis/max3`）；而单轴/纯转向都远小于 0.67（0.60 / 0.50 /
+    // 0.18），所以补上后**不影响已验证的单轴包线**。combo_max ≤ 0 表示关闭（旧行为）。
+    double combo_wz_ratio = 0.18;
+    double combo_max = 0.67;
+    // ---- 转向-平移「竞争项」（默认为 0 = 关闭，见下）----
+    //
+    // 历史：曾根据 `analyze_axis_sweep.py` 的统计拟合出 Δv ≈ 1.7·vxy·ωz²，并据此加了
+    // `vxy ≤ tol/(gain·ωz²)` 的守卫。**后来发现那是分析脚本的测量伪影**：脚本把整段
+    // 世界速度用「该段平均偏航」只旋转了一次，而原地转向时机身一直在转（0.5 rad/s×8 s
+    // = 4 rad），均值因此被系统性压小，转得越快压得越厉害 —— 正好伪造出一条 ∝ωz² 的
+    // “损失”。改成**逐帧**用该帧偏航旋转后，同一份 sim.csv：
+    //   (0.60, ωz0.50) 旧口径 0.222（“损失 0.379”）→ 逐帧口径 0.640（无损失）
+    //   (0.50vy, ωz0.50) 旧口径 0.155（“损失 0.345”）→ 逐帧口径 0.498（无损失）
+    // 也就是说**转向并不抢平移的摩擦预算**，三轴同时给也能跟上（只是姿态变差）。
+    // 因此这里默认关闭（0），只保留线性安全项；参数保留以便将来在真机上重新标定。
+    double combo_turn_gain = 1.7;
+    double combo_turn_loss = 0.0;   // ≤0 表示关闭
+    // 超限时的分配策略：
+    //   0 = 同比缩比（三轴按 k³ 等比缩，最“公平”，保方向保比例）← 默认
+    //   1 = 转向优先（只削平移，保 |wz|；遥控习惯“方向不能丢”）
+    //   2 = 平移优先（只削 wz，保平移；“先走起来再微调方向”）
+    int combo_priority = 0;
+    // ---- 单轴硬上限（命令级钳位）----
+    // 与 `gait_schedule.max_vx/vy/wz` 同一套值，但那个只用于主轴判定，不钳位。
+    // 实测（2026-11-01）：vx 0.60 / vy 0.50 / wz 1.00 是单轴可用上限，超过即退化，
+    // 所以在这里硬钳一下，保证任何上游（手柄、上层状态机、测试脚本）都超不过去。
+    // <=0 表示不钳。
+    double cmd_max_vx = 0.60;
+    double cmd_max_vy = 0.50;
+    double cmd_max_wz = 1.00;
+    // ---- 步态级速度/偏航率反馈（只作用于**足端轨迹**的步幅，不改变 MPC 参考）----
+    // 动机：足端轨迹用命令速度算步幅 `Δp = T_stance·(v + ω×p0)`，而实际机身速度由接触
+    // 滑动、摆动腿动量等决定。实测单轴 vx 闭环稳态**恒快 0.04–0.05 m/s**（0.15 → 0.204、
+    // 0.60 → 0.652），纯开环调参改不掉；用机体速度误差修正步幅可直接把稳态误差压到
+    // 一个增益的倒数。增益取 0 则完全回到旧行为。
+    double gait_vel_fb = 0.0;        // 机体速度误差 → 步幅修正（无量纲，建议 0.3–0.6）
+    double gait_yaw_fb = 0.0;        // 偏航率误差 → 转向步幅修正（无量纲，建议 0.2–0.5）
+    double gait_vel_trim = 0.0;      // 沿运动方向的步幅前馈修正 [m/s]（抵消恒定偏快）
+    double gait_cmd_limit_scale = 1.3;  // 反馈后步幅命令的放大上限（相对包络）
+    // **命令级**线速度偏置补偿 [m/s]（沿运动方向把 |v_cmd| 减掉这个值，再同时送进
+    // 步态与 MPC 参考）。
+    //
+    // 实测（闭环、单轴 8 s 段）：机身稳态速度近似等于 `指令 + 0.045`（vx 0.15→0.204、
+    // 0.30→0.355、0.45→0.494、0.60→0.653；vy 0.10→0.156、0.35→0.365）。
+    // 只改步幅（gait_vel_trim）或只改 MPC 参考（mpc_vel_trim）都无效，**同时**改才有效：
+    // S8_CMD_SCALE=0.667 的对照实验里 0.15→0.138、0.30→0.263、0.45→0.362，即整体
+    // 按比例缩、偏置随之下降 → 证明是「指令 + 常量」型偏差。
+    // 0 = 不补偿（默认）。仿真里 0.05 可把 0.15–0.60 的跟踪误差压到 0.01 量级；
+    // 换到真机必须重新标定（这是接触/滑移标定，不是通用控制增益）。
+    double cmd_vel_trim = 0.0;
+    // MPC 速度参考的前馈修正 [m/s]（沿运动方向缩小 |v_ref|）。
+    // 实测：机身稳态速度恒比指令快 0.04–0.05 m/s（vx 0.15→0.204、0.30→0.374、
+    // 0.45→0.495、0.60→0.652；vy 0.10→0.160、0.35→0.368），而**改足端步幅
+    // （反馈/trim）完全无效**——说明机身速度由 MPC 的速度参考闭环决定，不是步幅。
+    // 根因是 MPC 没有积分项，恒定扰动下必然有稳态误差；把参考预先减去该偏置即可。
+    double mpc_vel_trim = 0.0;
     // 质心高度命令的软启动变化率 [m/s]（0 = 关闭软启动，直接用 com_height）。
     // 实测：engage 时若高度命令与实测差 0.3 m，MPC 会立刻要求 ~30 m/s² 的竖直加速度，
     // 把 τ 顶到限幅附近、偶发顶翻机身。0.06 m/s 约 5 s 走完 0.3 m，起立过程平滑。
@@ -85,6 +145,10 @@ struct MpcWbcControllerParams {
     // 换成 1.0 后 0.15 / 0.30 / 0.45 / 0.60 m/s 全部 rc=0（0.75 超 docs/00 包线，仍失效）。
     double kp_scale_wbc = 1.0;
     double kd_scale_wbc = 1.0;
+    // 把 PD 叠加到 WBC 力矩之上的比例（0 = 完全抵消 PD，旧行为；1 = τ_wbc + pd）。
+    // 默认只作用于支撑腿（摆动腿已有足端任务，叠加 PD 会与其抢）。
+    double pd_extra = 0.0;
+    bool pd_extra_stance_only = true;
     // 是否把步态的期望足端速度用腿雅可比反解成期望关节速度（喂给 PD 的 kd 项与执行器前馈）。
     // true ：PD 的 kd 项量的是「真实关节速度相对**计划**关节速度」的偏差。
     // false：dq_des 恒为 0，kd 项退化为标准的速度阻尼 −kd·dq（与 S4 开环基线/站立环一致）。
@@ -139,7 +203,8 @@ struct MpcRequest {
     bool est_valid = false;
     int num_support = 0;
     GaitCommand cmd;
-    double yaw_ref = 0.0;              // 偏航角参考（世界系，由 1 kHz 线程积分）
+    double yaw_ref = 0.0;              // 偏航角参考（世界系，**连续不归一化**，由 1 kHz 线程积分）
+    double yaw_meas = 0.0;             // 连续（不归一化）的测量偏航角，与 yaw_ref 同一条数轴
     double height_cmd = 0.0;           // 质心高度命令（由 1 kHz 线程软启动后给出）
     std::array<std::array<bool, kNumLegs>, kMaxContactPreview> contact{};
     int contact_steps = 0;
@@ -318,6 +383,9 @@ public:
         cmd_filtered_ = GaitCommand();
         yaw_ref_ = 0.0;              // 进入时视为航向零点，之后由 yaw_rate_cmd 积分
         yaw_ref_initialized_ = false;
+        yaw_meas_cont_ = 0.0;
+        yaw_meas_prev_ = 0.0;
+        yaw_meas_initialized_ = false;
         height_cmd_ = 0.0;
         height_cmd_initialized_ = false;
         last_dt_ = 0.0;
@@ -381,17 +449,56 @@ public:
         // 命令用平滑后的值（比入参晚一帧，1 ms 陈旧对 20 Hz 的 MPC 无影响）——
         // 这样 1 kHz 线程与 MPC 线程看到的是同一条命令轨迹。
         req.cmd = cmd_filtered_;
+        // 软停步期间把 MPC 的速度/偏航参考按同一条步幅曲线缩下来：参考与足端规划
+        // 同源，停步时才不会「参考已归零、腿还在扫」而互相顶。
+        {
+            const double ps = gait_.plan_scale();
+            if (ps < 1.0) {
+                req.cmd.vx *= ps;
+                req.cmd.vy *= ps;
+                req.cmd.wz *= ps;
+            }
+        }
+        // MPC 速度参考前馈修正：机身稳态速度恒快一个常量（见 mpc_vel_trim 注释）。
+        if (params_.mpc_vel_trim > 0.0) {
+            const double vm = std::hypot(req.cmd.vx, req.cmd.vy);
+            if (vm > 1e-6) {
+                // 最多修正一半，避免很小的指令被削成 0（那会变成「原地踏步但报运动指令」）。
+                const double trim = std::min(params_.mpc_vel_trim, 0.5 * vm);
+                const double k = (vm - trim) / vm;
+                req.cmd.vx *= k;
+                req.cmd.vy *= k;
+            }
+        }
         // 偏航参考由 1 kHz 线程积分（不能用测量偏航，否则扰动造成的偏航永不回正）。
-        // 第一次使用时用测量偏航对齐，之后按**平滑后**的偏航率累加，与 req.cmd 同源。
+        //
+        // **整条偏航链路都用「连续不归一化」的角度**：测量值 `rpy.z()` 被仿真按 ±π 包络，
+        // 一旦机身航向越过 ±180° 就会出现分支切换。之前的做法是把参考也包到 ±π、再在
+        // MPC 入口对齐分支，数学上等价、实测却仍有与绝对航向相关的失稳：从 0° 起以
+        // 0.30 rad/s 转向，航向走到 ≈100° 后机开始 1 Hz 涡动（倾角 10–20°），
+        // 而同一段转动从 +90° 起步则完全干净；0.15 rad/s 连跑 45 s 也是「航向进入
+        // |yaw|≳110° 失稳、出了 ±180° 窗口自动收敛」。现改为在 1 kHz 线程里对测量偏航
+        // 做增量累加得到连续航向，参考同轴累加、不再 WrapPi，两路都无分支。
+        if (!yaw_meas_initialized_) {
+            yaw_meas_cont_ = in.rpy.z();
+            yaw_meas_prev_ = in.rpy.z();
+            yaw_meas_initialized_ = true;
+        } else {
+            yaw_meas_cont_ += WrapPi(in.rpy.z() - yaw_meas_prev_);
+            yaw_meas_prev_ = in.rpy.z();
+        }
         if (!yaw_ref_initialized_) {
-            yaw_ref_ = in.rpy.z();
+            yaw_ref_ = yaw_meas_cont_;
             yaw_ref_initialized_ = true;
         } else {
             const double d = in.t - last_yaw_ref_t_;
-            if (d > 0.0 && d < 0.1) yaw_ref_ = WrapPi(yaw_ref_ + cmd_filtered_.wz * d);
+            // 停步收步期间按同一条步幅曲线缩小偏航参考的推进速度，避免参考跑到机身前面。
+            const double ps = gait_.plan_scale();
+            if (d > 0.0 && d < 0.1) yaw_ref_ += ps * cmd_filtered_.wz * d;
         }
         last_yaw_ref_t_ = in.t;
         req.yaw_ref = yaw_ref_;
+        req.yaw_meas = yaw_meas_cont_;
         // 质心高度命令软启动：engage 瞬间 MPC 若看到「高度差 0.3 m」会立刻要 30 m/s² 的竖直
         // 加速度（实测 τ 顶到 28.7 N·m、偶发把机身顶翻）。这里从**实测高度**起步，按
         // com_height_slew 慢慢爬到期望高度。
@@ -435,7 +542,11 @@ public:
         mpc_in.p_com = com_world;
         mpc_in.v_com = req.base_vel + req.omega_body.cross(com_world - req.base_pos);
         mpc_in.rpy = req.rpy;
-        mpc_in.yaw_ref = req.yaw_ref;   // 参考由 1 kHz 线程积分，不用测量偏航
+        mpc_in.R_wb = R;
+        // 偏航参考与测量都已是**连续不归一化**的角度（见 BuildMpcRequest 注释），
+        // 这里直接相减即可，不需要任何 WrapPi 对齐。
+        mpc_in.rpy.z() = req.yaw_meas;
+        mpc_in.yaw_ref = req.yaw_ref;
         mpc_in.omega = req.omega_body;
         mpc_in.inertia_com_world = model_.CompositeInertiaWorld(req.q, R, req.com_body);
         for (int leg = 0; leg < kNumLegs; ++leg) {
@@ -506,12 +617,99 @@ private:
         const bool ramping = rel < p.stand_ramp_time;
         const bool settling = !ramping && rel < p.stand_ramp_time + p.stand_settle_time;
 
+        // ---- 命令级线速度偏置补偿（步态与 MPC 参考共用同一个目标） ----
+        GaitCommand target = in.cmd;
+        // ---- 单轴硬上限（单轴指令就是这三条）----
+        if (p.cmd_max_vx > 0.0) target.vx = std::max(-p.cmd_max_vx, std::min(p.cmd_max_vx, target.vx));
+        if (p.cmd_max_vy > 0.0) target.vy = std::max(-p.cmd_max_vy, std::min(p.cmd_max_vy, target.vy));
+        if (p.cmd_max_wz > 0.0) target.wz = std::max(-p.cmd_max_wz, std::min(p.cmd_max_wz, target.wz));
+        if (p.cmd_vel_trim > 0.0) {
+            const double vm = std::hypot(target.vx, target.vy);
+            if (vm > 1e-6) {
+                const double trim = std::min(p.cmd_vel_trim, 0.5 * vm);
+                target.vx *= (vm - trim) / vm;
+                target.vy *= (vm - trim) / vm;
+            }
+        }
+        // ---- 三轴组合约束（docs/00 §2.2）：超限时三轴同比例缩比，方向不变 ----
+        if (p.combo_max > 0.0) {
+            const double s = std::hypot(target.vx, target.vy) +
+                             p.combo_wz_ratio * std::fabs(target.wz);
+            if (s > p.combo_max) {
+                const double k = p.combo_max / s;
+                target.vx *= k;
+                target.vy *= k;
+                target.wz *= k;
+            }
+        }
+        // ---- 转向-平移摩擦竞争守卫（策略可选）----
+        // 线性约束只能防翻车；要保证「平移还能跟上」，必须把实测的平方竞争项也盖住。
+        // 超限后的分配策略见 `combo_priority`。
+        if (p.combo_turn_loss > 0.0) {
+            const double vxy = std::hypot(target.vx, target.vy);
+            const double wz_abs = std::fabs(target.wz);
+            const double w2 = target.wz * target.wz;
+            const double budget = p.combo_turn_loss / std::max(1e-6, p.combo_turn_gain);
+            if (vxy > 1e-9 && w2 > 1e-12 && vxy * w2 > budget) {
+                if (p.combo_priority == 1) {
+                    // 转向优先：保 wz，削平移
+                    const double k = budget / (vxy * w2);   // <1
+                    target.vx *= k;
+                    target.vy *= k;
+                } else if (p.combo_priority == 2) {
+                    // 平移优先：保平移，削 wz（求 vxy·w² = budget）
+                    const double k = std::sqrt(budget / vxy) / wz_abs;   // <1
+                    target.wz *= k;
+                } else {
+                    // 同比缩比：三轴同乘 k，使 k·vxy·(k·wz)² = budget → k³
+                    const double k = std::cbrt(budget / (vxy * w2));     // <1
+                    target.vx *= k;
+                    target.vy *= k;
+                    target.wz *= k;
+                }
+            }
+        }
         // ---- 命令平滑（阶跃命令会顶翻机身，见 cmd_tau 注释） ----
         last_dt_ = dt;
-        const GaitCommand cmd = SmoothCommand(in.cmd, dt);
+        const GaitCommand cmd = SmoothCommand(target, dt);
+
+        // ---- 步态级速度/偏航率反馈（只改**足端步幅**，不动 MPC 的速度参考） ----
+        // 估计量比本帧晚 1 ms（估计器在下方才更新），对 0.5–2 Hz 的步幅修正足够新鲜。
+        GaitCommand gait_cmd = cmd;
+        if (p.gait_vel_fb != 0.0 || p.gait_yaw_fb != 0.0 || p.gait_vel_trim != 0.0) {
+            const Vec3d v_body = R.transpose() * estimate_.base_vel_w;
+            const double wz_meas = in.omega_body.z();
+            if (p.gait_vel_trim != 0.0) {
+                // 沿命令方向收缩步幅（抵消「实际恒快一个常量」的标定偏差）。
+                const double vmag = std::hypot(cmd.vx, cmd.vy);
+                if (vmag > 1e-6) {
+                    const double k = std::max(0.0, vmag - p.gait_vel_trim) / vmag;
+                    gait_cmd.vx *= k;
+                    gait_cmd.vy *= k;
+                }
+            }
+            if (p.gait_vel_fb != 0.0) {
+                gait_cmd.vx += p.gait_vel_fb * (cmd.vx - v_body.x());
+                gait_cmd.vy += p.gait_vel_fb * (cmd.vy - v_body.y());
+            }
+            if (p.gait_yaw_fb != 0.0) {
+                gait_cmd.wz += p.gait_yaw_fb * (cmd.wz - wz_meas);
+            }
+            // 限幅：反馈最多把步幅放大到包络的 gait_cmd_limit_scale 倍。
+            const double lim = std::max(1.0, p.gait_cmd_limit_scale);
+            const double lvx = lim * p.gait_schedule.max_vx;
+            const double lvy = lim * p.gait_schedule.max_vy;
+            const double lwz = lim * p.gait_schedule.max_wz;
+            gait_cmd.vx = std::max(-lvx, std::min(lvx, gait_cmd.vx));
+            gait_cmd.vy = std::max(-lvy, std::min(lvy, gait_cmd.vy));
+            gait_cmd.wz = std::max(-lwz, std::min(lwz, gait_cmd.wz));
+        }
 
         // ---- 步态（同一相位源驱动支撑集、足端目标与 MPC 的接触计划） ----
-        const auto legs = gait_.Update(in.t, cmd);
+        // 停步判定用**原始**命令：平滑后的命令衰减太慢，会给收步叠加 ~0.75 s 延迟。
+        const bool raw_cmd_zero =
+            gait_.NormalizedSpeed(in.cmd) < gait_.params().stop_threshold;
+        const auto legs = gait_.Update(in.t, gait_cmd, raw_cmd_zero);
         out.stance = {{legs[kFL].contact, legs[kFR].contact, legs[kHL].contact, legs[kHR].contact}};
         const bool stepping = gait_.stepping();
 
@@ -680,14 +878,22 @@ private:
 
             // 摆动足期望：机体系目标 → 世界系（默认只用偏航，避免把机身倾斜写进轨迹）
             const Mat3d R_ref = p.swing_target_yaw_only ? YawOnly(R) : R;
+            // 四足的**规划世界足位/足速**都给出来：摆动腿用于足端 PD，支撑腿用于接触
+            // 约束的位置/速度反馈（`kp_stance_pos` / `kd_stance_pos`）。两者共用同一份
+            // 计划，保证一致。
+            // 支撑腿的速度参考必须是规划值而不是零：原地转向时足端要沿 ω×r 滑动，
+            // 阻尼到零等于持续输入反向水平力（力臂 = 质心高度），是转向「涡动」的诱因。
+            for (int leg = 0; leg < kNumLegs; ++leg) {
+                win.foot_pos_des_world[leg] = estimate_.base_pos_w + R_ref * legs[leg].foot_pos;
+                win.foot_vel_des_world[leg] = R_ref * legs[leg].foot_vel;
+            }
             out.stance_count = 0;
             for (int leg = 0; leg < kNumLegs; ++leg) {
                 if (win.stance[leg]) {
                     ++out.stance_count;
                     continue;
                 }
-                win.foot_des_world[leg] = estimate_.base_pos_w + R_ref * legs[leg].foot_pos;
-                win.foot_vel_des_world[leg] = R_ref * legs[leg].foot_vel;
+                win.foot_des_world[leg] = win.foot_pos_des_world[leg];
                 out.swing_des_z[leg] = win.foot_des_world[leg].z();
                 out.swing_now_z[leg] = win.foot_pos_world[leg].z();
             }
@@ -744,6 +950,17 @@ private:
                 // 结论：τ_ff 顶限是「关节跟踪不足」的**症状**而非独立 bug，应从 kp/kd 与参考
                 // 轨迹的激进度上治（见 docs/05 的 PD 增益扫描），此处保留夹取。
                 tau_ff = out.tau_wbc(j) - pd;
+                // 可选：把一部分/全部 PD 叠加到 WBC 之上：
+                //   τ_applied = τ_wbc + pd_extra·pd
+                // （τ_ff = τ_wbc − pd + pd_extra·pd）。pd_extra=0 就是原来的「完全抵消 PD」。
+                // 对齐 legged_control 的执行律 τ = τ_wbc + kp(q_des−q) + kd(dq_des−dq)：
+                // 支撑腿只有加速度级接触约束、没有位置权威（腿会整体滑移），叠加 PD 是最
+                // 直接的位置反馈；代价是 WBC 的等效力矩被 PD 顶偏，需要小步验证。
+                if (p.pd_extra > 0.0) {
+                    const int leg = j / 3;
+                    if (!p.pd_extra_stance_only || out.stance[static_cast<int>(leg)])
+                        tau_ff += p.pd_extra * pd;
+                }
                 tau_ff = std::max(-p.wbc.tau_max, std::min(p.wbc.tau_max, tau_ff));
             }
             out.joint_cmd(j, 4) = static_cast<float>(tau_ff);
@@ -840,9 +1057,12 @@ private:
 
     double t_enter_ = 0.0;
     double last_t_ = 0.0;
-    double yaw_ref_ = 0.0;              // 偏航角参考（世界系，1 kHz 积分）
+    double yaw_ref_ = 0.0;              // 偏航角参考（世界系，连续不归一化，1 kHz 积分）
     double last_yaw_ref_t_ = 0.0;
     bool yaw_ref_initialized_ = false;
+    double yaw_meas_cont_ = 0.0;        // 连续（不归一化）的测量偏航角
+    double yaw_meas_prev_ = 0.0;
+    bool yaw_meas_initialized_ = false;
     double t_mpc_ = -1e9;
     Vec12d q_start_ = Vec12d::Zero();
     Vec12d q_des_ = Vec12d::Zero();

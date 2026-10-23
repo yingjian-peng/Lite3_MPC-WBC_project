@@ -10,7 +10,7 @@ __pycache__/
 # WBC 单测导出的 MuJoCo 复核用例（生成物）
 wbc_mujoco_cases.csv
 
-
+mpc_wbc/test
 support/third_party/libtorch
 support/third_party/x30_motion_sdk
 **/tmp/*

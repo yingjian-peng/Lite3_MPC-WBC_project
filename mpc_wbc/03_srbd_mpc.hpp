@@ -69,6 +69,7 @@ struct SrbdMpcInput {
     Vec3d v_com = Vec3d::Zero();              // 质心速度（世界系）
     Vec3d rpy = Vec3d::Zero();                // 基座姿态（ZYX 欧拉角，**测量值**）
     Vec3d omega = Vec3d::Zero();              // 基座角速度（机体系）
+    Mat3d R_wb = Mat3d::Identity();           // 机体系 → 世界系旋转（必须与 rpy 一致）
     Mat3d inertia_com_world = Mat3d::Zero();  // 绕质心的整机惯量（世界系）
     std::array<Vec3d, kNumLegs> foot_pos_world{};  // 四足足端作用点（世界系）
 
@@ -213,7 +214,16 @@ public:
             const Var& var = vars[v];
             const Vec3d d = gens[var.gen];
             const Vec3d r = in.foot_pos_world[var.leg] - in.p_com;
-            const Vec3d alpha = inertia_inv * r.cross(d);
+            // 角加速度通道必须是**机体系**表达：状态里的 ω（下标 9..11）是机体系角速度，
+            // 而 `EulerRateMatrix` 也是把机体系角速度映射到欧拉角速率。原来这里直接用了
+            // 世界系力矩算出的世界系角加速度，两份坐标系混用 —— 在 rpy≈0 时恰好一致，
+            // 一旦机身偏航变大就会失真（偏航 180° 时滚转/俯仰通道直接**符号反转**），
+            // MPC 于是把 wrench 预报成反向效果 → 正反馈。实测现象与之完全吻合：
+            //   从 0° 起以 0.30 rad/s 原地转，航向进入 |yaw|≳110° 后开始 1 Hz 涡动
+            //   （倾角 10–20°），出了 ±180° 窗口自动收敛；从 +90° 起转则相对转角完全
+            //   不同、但仍在同一个**绝对航向**窗口失稳；直线行走（航向恒 0）从来不出问题。
+            const Vec3d alpha_world = inertia_inv * r.cross(d);
+            const Vec3d alpha = in.R_wb.transpose() * alpha_world;  // → 机体系
 
             Eigen::Matrix<double, 12, 1> B = Eigen::Matrix<double, 12, 1>::Zero();
             B.segment<3>(0) = (0.5 * dt * dt / m) * d;

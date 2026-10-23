@@ -106,6 +106,70 @@ LITE3_CONTROL_PATH=mpc_wbc ./build/mpc_control
 
 各文件职责和模块关系见 [工程结构与文件说明](docs/01_project_structure.md)。模型说明见 [robot_models/README.md](robot_models/README.md)。
 
-## 6. 来源与许可
+## 6. MPC+WBC 单轴调试与回归
+
+除主程序外，构建还会产出两个离线 harness（`-DBUILD_MPC_WBC_SIM=OFF` 可关闭）：
+`build/mpc_wbc/mpc_wbc_mpc_wbc_sim`（闭环 MPC+WBC）与
+`build/mpc_wbc/mpc_wbc_position_loop_sim`（开环位置环基线）。二者通过 UDP 与
+`mujoco_simulation.py` 通信，可脚本化下发速度段，而不用手按键盘。
+
+单轴 vx / vy / wz 扫速（±4 档 × 8 s + 2 s 停步，**强制开 viewer**）：
+
+```bash
+# 三条都跑（约 5 分钟），日志写 build/single_axis/r11_{vx,vy,wz}/
+OUTROOT=build/single_axis/r11 mpc_wbc/test/run_single_axis.sh "vx vy wz"
+# 只跑一个轴
+mpc_wbc/test/run_single_axis.sh wz
+```
+
+脚本内部用 `run_s8_case.py --sim-env MUJOCO_VIEWER=1` 起仿真，跑完自动调用
+`mpc_wbc/test/analyze_axis_sweep.py` 输出逐段线性/偏航跟踪误差、纹波和倾角。
+判定口径：线速度/偏航误差 ≤ 0.05（m/s、rad/s），倾角 ≤ 10°，>25° 或机身高度
+< 0.15 m 记 FELL。
+
+当前实测（2026-11-01，单轴 8 s/段）：
+
+**最终指标：$v_x$ 0.10–0.60 m/s / $v_y$ 0.10–0.50 m/s / $\omega_z$ 0.10–1.00 rad/s**
+（`mpc_wbc/test/scenarios/spec_vx.csv` / `spec_vy.csv` / `spec_wz.csv` 为对应的验收场景）。
+2026-11-01 修复 SRBD-MPC 角加速度坐标系混用（详见 `docs/05_优化日志.md`「R11 收尾」）
+之后，转向不再是「时好时坏」：
+
+| 工况 | 跟踪误差 | 倾角 max / p95 | 结论 |
+| --- | --- | --- | --- |
+| vx ±0.20 / ±0.40 / ±0.60（`S8_CMD_VTRIM=0.05`） | ≤ 0.025 | ≤ 5.1° | ✅ |
+| vy ±0.10…±0.50（`S8_CMD_VTRIM=0.03`） | ≤ 0.033 | ≤ 7.6° | ✅（0.60 仍可用、0.80 失效） |
+| wz ±0.10 / ±0.20 / ±0.30 | ≤ 0.003 rad/s | 0.7–0.9° | ✅ 双向全过 |
+| wz ±1.00（12 s 长段，±1.9 圈） | ≤ 0.002 rad/s | ≤ 2.7° | ✅ 失稳点 ≈2.5 rad/s |
+| wz −0.30 连转 37 s（航向走两整圈） | ≤ 0.007 rad/s | ≤ 1.2° | ✅ |
+| vx 0.60 + vy 0.50（纯平移组合） | 0.569 / 0.425 | 8.4° | ✅ |
+| vx 0.60 + wz 0.50 | 0.640 / 0.483 | 5.5° | ✅ |
+| vy 0.50 + wz 0.50 | 0.504 / 0.495 | 6.7° | ✅ |
+| vx 0.60 + vy 0.50 | 0.564 / 0.424 | 8.1° | ✅ |
+| 三轴满量程（削到 0.418/0.349/0.697） | 0.494 / 0.306 / 0.692 | 7.9° | ✅ |
+| 同上但关闭组合约束 | 发散 | **46.6°** | ❌ 翻车 |
+
+组合工况只需要一条线性归一化（`docs/00 §2.2`）：$v_{xy}+0.18\lvert\omega_z\rvert\le0.67$，
+超限三轴同比缩比。单轴钳位 `S8_CMDMAX_VX/VY/WZ`，组合约束 `S8_COMBO_MAX` / `S8_COMBO_WZ`。
+一键验收：`mpc_wbc/test/run_acceptance.sh`（单轴 / 组合 / 三轴满量程，默认开 viewer）。
+
+修复前的历史数据（保留作对照）：wz ±0.30 倾角 5–15°、±0.40 10–12°、±0.50 13–18°，
+且同一指令在不同航向下的结果相差 10° 以上。
+
+线速度「恒快 ~0.045 m/s」是接触/滑移标定问题，已加**命令级补偿**
+`S8_CMD_VTRIM`（默认 0）。仿真里加 `--env S8_CMD_VTRIM=0.05` 可把 vx 全速段误差
+压到 0.01 量级（vy 低速段同样有效，但 vy=0.30 会欠速 0.034，兼顾两轴可取 0.03）：
+
+```bash
+EXTRA_CTRL_ENV="--env S8_CMD_VTRIM=0.05" mpc_wbc/test/run_single_axis.sh vx
+```
+
+调试开关（全部只影响 harness 的 `MpcWbcControllerParams`）：`S8_MPC_VTRIM`
+（MPC 速度参考前馈）、`S8_GAIT_VFB` / `S8_GAIT_WFB` / `S8_GAIT_VTRIM`（步态级
+速度/偏航率反馈与步幅 trim）、`S8_KV_STANCE`（支撑足速度阻尼）、`S8_Q_VXY` /
+`S8_Q_YAW` / `S8_Q_WYAW` / `S8_Q_RP` / `S8_Q_WRP`（MPC 权重）、
+`S8_SWING_LOW/MID/HIGH`（分段抬腿高度）。细节与已证伪路线见
+[docs/05_优化日志.md](docs/05_优化日志.md) R11 节。
+
+## 7. 来源与许可
 
 本工程基于云深处的 [Lite3_rl_deploy](https://github.com/DeepRoboticsLab/Lite3_rl_deploy) 整理。源码许可见 [LICENSE](LICENSE)。
