@@ -75,6 +75,28 @@ struct WbcParams {
     //   w_posture=1   → 摆动任务残差 3.92  m/s²、基座误差 0.745（两项同时变差）
     // 参考工程（09_weighted_wbc）没有该任务，只有「基座 6D + 摆动足」两项。需要时显式打开。
     double w_posture = 0.0;
+    // 支撑腿关节姿势正则（加速度级，**默认 0 = 关闭**，env `S8_W_POSTURE_ST`）。
+    //
+    // 动机：支撑腿只有「足端零加速度」3 行约束，而一条腿有 3 个关节；再叠加 EoM 的
+    // 6 行基座等式后，支撑腿的关节构型看起来在这组约束的零空间里是自由的。而
+    // `tau_ff = τ_wbc − pd` 让总力矩恰等于 τ_wbc，**PD 被完全抵消**，所以关节位置
+    // 没有任何直接权威（qerr 在 0.15 m/s 就有 0.22 rad、与速度无关）。很自然地会
+    // 想用这一项把零空间钉住。
+    //
+    // 实测结论：**无效，不要开**。参考换成 IK 的 q_des 后重新扫过一遍
+    // （walk 曲线，0.15 m/s）：
+    //   w=0.1 → baseErr p95 从 0.33 涨到 4.46，qerr 反而 0.174→更大，倾角 max 5.49°
+    //   w=1   → baseErr p95 14.97，qerr 0.238，倾角 max 9.47°
+    //   w=10  → 直接失稳（8.6 s）
+    // 原因：那 0.22 rad 的自运动**不在基座任务的零空间里**，任何关节级正则都会与
+    // 基座任务硬抢（即使权重只有 0.1）。所以 qerr 是「反向动力学总力矩 + PD 被抵消」
+    // 这个写法的**固有特性**，要降它只能改架构（让 PD 叠加在前馈之上而不是被抵消），
+    // 不是调参能解决的。代码保留仅为记录这条已被排除的路径。
+    double w_posture_stance = 0.0;
+    // 参考由控制器给出：`WbcInput::q_nominal` 在行走时传的是步态 IK 的 q_des（不是站姿），
+    // 否则会在行走时反着拉。增益不需要大：参考已经是正确的关节目标，这里只是补位置权威。
+    double kp_posture_stance = 20.0;  // 姿势正则位置增益 [1/s²]
+    double kd_posture_stance = 5.0;   // 姿势正则阻尼增益 [1/s]
     // 力矩努力正则（零空间二次项，**默认 0 = 关闭**）。它不是零空间的：w_tau=1e-3 已足以把
     // 基座任务从 q̈_x=0.5 拉到 0.4999869（误差 1.3e-5，w_tau=0 时 4.2e-9），因为「跟准基座」
     // 与「省力矩」在同一组接触力/力矩上折中；参考工程实测它还会造成承力甩锅与静立缓漂。
@@ -435,6 +457,24 @@ public:
                 A(0, 6 + j) = 1.0;
                 Eigen::VectorXd bv = Eigen::VectorXd::Constant(1, b);
                 add_task(A, bv, p.w_posture);
+            }
+        }
+        // ④' 支撑腿关节姿势正则（**实测无效，默认关闭**，结论见 w_posture_stance 注释）。
+        // 带阻尼项：支撑腿承重且与地面构成闭环，纯刚度项容易在 1 kHz 下抖。
+        // 注意与 ④ 的区别：④ 作用于摆动腿（与摆动足任务抢同一组关节，默认关闭），
+        // ④' 作用于支撑腿。
+        if (p.w_posture_stance > 0.0) {
+            for (int leg = 0; leg < kNumLegs; ++leg) {
+                if (!in.stance[leg]) continue;
+                for (int k = 0; k < 3; ++k) {
+                    const int j = 3 * leg + k;
+                    const double b = p.kp_posture_stance * (in.q_nominal(j) - in.q(j)) -
+                                     p.kd_posture_stance * in.qvel(j);
+                    Eigen::MatrixXd A = Eigen::MatrixXd::Zero(1, kWbcNvar);
+                    A(0, 6 + j) = 1.0;
+                    Eigen::VectorXd bv = Eigen::VectorXd::Constant(1, b);
+                    add_task(A, bv, p.w_posture_stance);
+                }
             }
         }
         // ⑤ 力矩努力正则（零空间）

@@ -163,7 +163,8 @@ int main(int argc, char** argv) {
             "kp,tau_ff_max,tau_wbc_max,sum_fz,a_des_x,a_des_z,alpha_des_y,eom_res,contact_res,"
             "cone_viol,base_acc_err,swing_acc_err,wbc_iters,wbc_ms,mpc_ms,step_ms,mpc_status,"
             "mpc_iters,mpc_res,v_est_x,v_est_y,wrench_age,mpc_reason,mpc_held,"
-                 "nstance,sdz0,saz0,sdz1,saz1,sdz2,saz2,sdz3,saz3\n";
+                 << "nstance,sdz0,saz0,sdz1,saz1,sdz2,saz2,sdz3,saz3,"
+                 << "pd_max,qerr_max,tff_clip,vcmd_x,fx_net\n";
     dcsv.flush();
 
     double cmd_scale = 1.0;   // 命令缩放（A/B 用）
@@ -174,6 +175,10 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("S8_PD_SCALE")) cparams.kp_scale_wbc = cparams.kd_scale_wbc = std::atof(e);
     if (const char* e = std::getenv("S8_DQ_FF")) cparams.swing_joint_vel_ff = (std::atoi(e) != 0);
     if (const char* e = std::getenv("S8_W_SWING")) cparams.wbc.w_swing = std::atof(e);
+    // 支撑腿姿势正则：权重量级参考摆动任务（w_swing=100），但它是零空间填充项、
+    // 只要求与基座任务（w_base=1）同量级或更小。
+    if (const char* e = std::getenv("S8_W_POSTURE_ST"))
+        cparams.wbc.w_posture_stance = std::atof(e);
     if (const char* e = std::getenv("S8_MPC_PERIOD")) cparams.mpc_period = std::atof(e);
     if (const char* e = std::getenv("S8_HYST")) cparams.wbc_enable_hold_frames = std::atoi(e);
     if (const char* e = std::getenv("S8_CMD_SCALE")) cmd_scale = std::atof(e);
@@ -183,6 +188,21 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("S8_GAIT_PERIOD")) cparams.gait.period = std::atof(e);
     if (const char* e = std::getenv("S8_GAIT_DUTY")) cparams.gait.duty = std::atof(e);
     if (const char* e = std::getenv("S8_GAIT_SWING")) cparams.gait.swing_height = std::atof(e);
+    // 分段调度的**闭环专用**抬腿高度覆盖。不动 SegmentedGaitParams::Baseline() 是因为
+    // 那份参数与开环位置环共用（docs/00 §3、openloop-baseline-v1），改了会破坏 A/B 可比性。
+    //
+    // 依据：高速段（0.44 s / 0.625 / 0.07）在闭环 0.60 m/s 下净空不够。隔离实验
+    // （恒定 −0.60 m/s，固定 0.44/0.625）：
+    //   swing_height=0.07 → 1/3 次通过（倾角单调缓漂后倒）
+    //   swing_height=0.10 → 3/3 次通过
+    // 开环位置环能靠关节跟踪滞后"吃掉"一部分净空（实际抬脚只有 3–5 cm 也还能走），
+    // 而 MPC+WBC 的摆动任务是足端加速度级、跟踪更紧，0.07 m 的命令在 0.60 m/s 下不够。
+    if (const char* e = std::getenv("S8_SWING_LOW"))
+        cparams.gait_schedule.low.swing_height = std::atof(e);
+    if (const char* e = std::getenv("S8_SWING_MID"))
+        cparams.gait_schedule.mid.swing_height = std::atof(e);
+    if (const char* e = std::getenv("S8_SWING_HIGH"))
+        cparams.gait_schedule.high.swing_height = std::atof(e);
     if (const char* e = std::getenv("S8_NOM_X")) cparams.nominal_x = std::atof(e);
     // 摆动足任务增益：w_swing 是 QP 权重，kp/kd_swing 是任务空间 PD 增益。
     // 实测摆动净空只有目标的 ~25%（FL/HR 有 85–90% 的摆动时间在拖地），优先调 PD 增益。
@@ -359,9 +379,18 @@ int main(int argc, char** argv) {
 
         if (controller_started) {
             double tau_ff_max = 0.0, sum_fz = 0.0;
-            for (int j = 0; j < 12; ++j)
+            double pd_max = 0.0, qerr_max = 0.0;
+            int tff_clip = 0;
+            for (int j = 0; j < 12; ++j) {
                 tau_ff_max = std::max(tau_ff_max, std::fabs(static_cast<double>(cmd(j, 4))));
+                pd_max = std::max(pd_max, std::fabs(out.tau_pd(j)));
+                qerr_max = std::max(qerr_max, std::fabs(out.q_des(j) - q_meas(j)));
+                // 前馈夹取是否被顶到（判据用 WBC 的容差相同的 tau_max）
+                if (std::fabs(static_cast<double>(cmd(j, 4))) >= 29.99) ++tff_clip;
+            }
             for (int leg = 0; leg < kNumLegs; ++leg) sum_fz += out.foot_force[leg].z();
+            double sum_fx = 0.0;
+            for (int leg = 0; leg < kNumLegs; ++leg) sum_fx += out.foot_force[leg].x();
             dcsv << t << "," << phases[idx].name << "," << ModeName(out.mode) << ","
                  << (out.wbc_active ? 1 : 0) << "," << (out.wbc_stale ? 1 : 0) << "," << out.dt << ","
                  << (tilt * 180.0 / M_PI) << "," << out.height << "," << out.est_confidence << ","
@@ -380,6 +409,8 @@ int main(int argc, char** argv) {
                  << "," << out.swing_des_z[1] << "," << out.swing_now_z[1]
                  << "," << out.swing_des_z[2] << "," << out.swing_now_z[2]
                  << "," << out.swing_des_z[3] << "," << out.swing_now_z[3]
+                 << "," << pd_max << "," << qerr_max << "," << tff_clip
+                 << "," << controller.smoothed_command().vx << "," << sum_fx
                  << "\n";
             // 注意：文件 flush 会阻塞几 ms，绝不能放在控制计时区间里（这里在写行之后）
             if (static_cast<long>(rel * 1000) % 500 == 0) dcsv.flush();

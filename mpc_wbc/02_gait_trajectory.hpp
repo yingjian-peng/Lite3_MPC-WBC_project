@@ -110,6 +110,26 @@ struct SegmentedGaitParams {
         return s;
     }
 
+    /// 闭环（MPC+WBC）专用三段参数：周期/占空比与 `Baseline()` 完全一致，**只把高速段
+    /// 的抬腿高度 0.07 → 0.10**。
+    ///
+    /// 为什么不直接改 `Baseline()`：那一份与开环位置环共用（见上），改了会让
+    /// `openloop-baseline-v1` 的验收数据不可比。
+    ///
+    /// 依据：恒定 −0.60 m/s 的隔离实验（固定 0.44/0.625，其余不变）
+    ///   swing_height=0.07 → 1/3 次通过，倾角单调缓漂（3°→7°→13°→倒）
+    ///   swing_height=0.10 → 3/3 次通过
+    /// 走出厂调度路径、只覆盖高速段同样 3/3 通过。机理：开环位置环可以靠关节
+    /// 跟踪滞后把命令净空 0.07 m “吃掉”一部分（实际只有 3–5 cm）仍能行走；而 MPC+WBC
+    /// 的摆动任务是**足端加速度级**、跟踪更紧，0.60 m/s 下 0.07 m 的正向净空不够，
+    /// 摆动脚刮地会把机身推歪。低速/中速段（速度低、步幅小）0.07 m 已验证充足，
+    /// 保持原值以免无谓抬腿增加能耗。
+    static SegmentedGaitParams BaselineClosedLoop() {
+        SegmentedGaitParams s = Baseline();
+        s.high.swing_height = 0.10;
+        return s;
+    }
+
     static double SmoothStep01(double x) {
         x = std::max(0.0, std::min(1.0, x));
         return x * x * (3.0 - 2.0 * x);

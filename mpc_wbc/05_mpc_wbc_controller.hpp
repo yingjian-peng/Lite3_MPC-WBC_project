@@ -109,7 +109,7 @@ struct MpcWbcControllerParams {
     // 三段式步态调度：打开后 gait 只在 use_gait_schedule=false 时生效。
     // 默认用开环基线 openloop-baseline-v1 的同一套参数，保证两条路径可比。
     bool use_gait_schedule = true;
-    SegmentedGaitParams gait_schedule = SegmentedGaitParams::Baseline();
+    SegmentedGaitParams gait_schedule = SegmentedGaitParams::BaselineClosedLoop();
     // 标称足位前后偏移（按整机质心配平，与位置环基线一致）[m]
     double nominal_x = -0.0133;
     SrbdMpcParams mpc;
@@ -139,6 +139,7 @@ struct MpcRequest {
     bool est_valid = false;
     int num_support = 0;
     GaitCommand cmd;
+    double yaw_ref = 0.0;              // 偏航角参考（世界系，由 1 kHz 线程积分）
     double height_cmd = 0.0;           // 质心高度命令（由 1 kHz 线程软启动后给出）
     std::array<std::array<bool, kNumLegs>, kMaxContactPreview> contact{};
     int contact_steps = 0;
@@ -315,6 +316,8 @@ public:
         q_start_ = q_now;
         q_des_ = q_now;
         cmd_filtered_ = GaitCommand();
+        yaw_ref_ = 0.0;              // 进入时视为航向零点，之后由 yaw_rate_cmd 积分
+        yaw_ref_initialized_ = false;
         height_cmd_ = 0.0;
         height_cmd_initialized_ = false;
         last_dt_ = 0.0;
@@ -378,6 +381,17 @@ public:
         // 命令用平滑后的值（比入参晚一帧，1 ms 陈旧对 20 Hz 的 MPC 无影响）——
         // 这样 1 kHz 线程与 MPC 线程看到的是同一条命令轨迹。
         req.cmd = cmd_filtered_;
+        // 偏航参考由 1 kHz 线程积分（不能用测量偏航，否则扰动造成的偏航永不回正）。
+        // 第一次使用时用测量偏航对齐，之后按**平滑后**的偏航率累加，与 req.cmd 同源。
+        if (!yaw_ref_initialized_) {
+            yaw_ref_ = in.rpy.z();
+            yaw_ref_initialized_ = true;
+        } else {
+            const double d = in.t - last_yaw_ref_t_;
+            if (d > 0.0 && d < 0.1) yaw_ref_ = WrapPi(yaw_ref_ + cmd_filtered_.wz * d);
+        }
+        last_yaw_ref_t_ = in.t;
+        req.yaw_ref = yaw_ref_;
         // 质心高度命令软启动：engage 瞬间 MPC 若看到「高度差 0.3 m」会立刻要 30 m/s² 的竖直
         // 加速度（实测 τ 顶到 28.7 N·m、偶发把机身顶翻）。这里从**实测高度**起步，按
         // com_height_slew 慢慢爬到期望高度。
@@ -421,6 +435,7 @@ public:
         mpc_in.p_com = com_world;
         mpc_in.v_com = req.base_vel + req.omega_body.cross(com_world - req.base_pos);
         mpc_in.rpy = req.rpy;
+        mpc_in.yaw_ref = req.yaw_ref;   // 参考由 1 kHz 线程积分，不用测量偏航
         mpc_in.omega = req.omega_body;
         mpc_in.inertia_com_world = model_.CompositeInertiaWorld(req.q, R, req.com_body);
         for (int leg = 0; leg < kNumLegs; ++leg) {
@@ -601,7 +616,16 @@ private:
             win.qvel = qvel;
             win.R_wb = R;
             win.stance = out.stance;
-            win.q_nominal = p.stand_q;
+            // 名义关节角 = 步态足端 IK 的 q_des_（不是站姿 stand_q）。
+            //
+            // 支撑腿只有「足端零加速度」3 行约束，而髋俯仰与膝关节可以在「足端不动」的
+            // 前提下互相补偿（自运动），所以支撑腿关节构型在约束的零空间里是自由的。
+            // 又因为 tau_ff = τ_wbc − pd 让总力矩恰等于 τ_wbc，PD 被完全抵消、对关节
+            // 位置没有任何权威 —— 于是自运动无人约束，qerr 长期停在 0.22 rad，pd 常驻
+            // 20+ N·m，稍有扰动就顶穿 ±30，tau_ff 饱和后力矩不再等于 τ_wbc，随即失稳。
+            // WBC 的姿势任务（w_posture_stance）就是补这个位置权威的入口，它的参考必须
+            // 是**步态给出的关节目标** q_des_；用 stand_q 会在行走时反着拉。
+            win.q_nominal = q_des_;
             for (int leg = 0; leg < kNumLegs; ++leg) {
                 const Vec3d foot_body = model_.FootPositionBody(leg, in.q.segment<3>(3 * leg));
                 win.foot_pos_world[leg] = estimate_.base_pos_w + R * foot_body;
@@ -758,6 +782,13 @@ private:
         return R;
     }
 
+    /// 把角度归一化到 (−π, π]，避免偏航参考长期积分后越界。
+    static double WrapPi(double a) {
+        a = std::fmod(a + M_PI, 2.0 * M_PI);
+        if (a < 0.0) a += 2.0 * M_PI;
+        return a - M_PI;
+    }
+
     void ClipToJointLimits(Vec12d* q) const {
         for (int leg = 0; leg < kNumLegs; ++leg)
             for (int j = 0; j < 3; ++j) {
@@ -809,6 +840,9 @@ private:
 
     double t_enter_ = 0.0;
     double last_t_ = 0.0;
+    double yaw_ref_ = 0.0;              // 偏航角参考（世界系，1 kHz 积分）
+    double last_yaw_ref_t_ = 0.0;
+    bool yaw_ref_initialized_ = false;
     double t_mpc_ = -1e9;
     Vec12d q_start_ = Vec12d::Zero();
     Vec12d q_des_ = Vec12d::Zero();

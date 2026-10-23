@@ -1,0 +1,4 @@
+phase,duration,vx,vy,wz
+fast050,5.0,0.50,0,0
+slow020,8.0,0.20,0,0
+stop,2.0,0,0,0

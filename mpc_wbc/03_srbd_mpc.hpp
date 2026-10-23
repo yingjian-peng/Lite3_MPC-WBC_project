@@ -67,7 +67,7 @@ struct SrbdMpcInput {
     // 当前状态
     Vec3d p_com = Vec3d::Zero();              // 质心位置（世界系）
     Vec3d v_com = Vec3d::Zero();              // 质心速度（世界系）
-    Vec3d rpy = Vec3d::Zero();                // 基座姿态（ZYX 欧拉角）
+    Vec3d rpy = Vec3d::Zero();                // 基座姿态（ZYX 欧拉角，**测量值**）
     Vec3d omega = Vec3d::Zero();              // 基座角速度（机体系）
     Mat3d inertia_com_world = Mat3d::Zero();  // 绕质心的整机惯量（世界系）
     std::array<Vec3d, kNumLegs> foot_pos_world{};  // 四足足端作用点（世界系）
@@ -75,6 +75,13 @@ struct SrbdMpcInput {
     // 命令
     Vec3d v_cmd = Vec3d::Zero();  // 期望质心速度（世界系，水平两维有效）
     double yaw_rate_cmd = 0.0;    // 期望偏航角速度 [rad/s]
+    // 偏航角**参考**（世界系），由上层用 yaw_rate_cmd 积分得到。
+    //
+    // 绝不能用 `rpy.z()`（测量值）当参考：那样参考会随实际偏航一起漂，MPC 对偏航扰动
+    // 没有任何回正激励，任何一次扰动造成的偏航都变成永久误差。实测闭环 5 分钟
+    // ±0.30 m/s 往返 10 次（空转测试）累积 **−12.1°** 航向漂移，而开环位置环是 −0.03°；
+    // 逐次排查发现每次**方向反转**都会踢出 −3～−5° 的偏航台阶，之后不再回正。
+    double yaw_ref = 0.0;
     double height_cmd = 0.0;      // 期望质心高度 [m]
 
     // 未来 N 步接触计划（来自步态相位），长度须 ≥ N
@@ -238,7 +245,7 @@ public:
             ref.segment<3>(0) = Vec3d(in.p_com.x() + in.v_cmd.x() * tk,
                                       in.p_com.y() + in.v_cmd.y() * tk, in.height_cmd);
             ref.segment<3>(3) = in.v_cmd;
-            ref.segment<3>(6) = Vec3d(0.0, 0.0, in.rpy.z() + in.yaw_rate_cmd * tk);
+            ref.segment<3>(6) = Vec3d(0.0, 0.0, in.yaw_ref + in.yaw_rate_cmd * tk);
             ref.segment<3>(9) = Vec3d(0.0, 0.0, in.yaw_rate_cmd);
 
             const Eigen::Matrix<double, 12, 1> e = x_free[k] - ref;
