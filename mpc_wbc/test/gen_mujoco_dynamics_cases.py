@@ -91,8 +91,8 @@ def main():
         d.qvel[:] = qvel
 
         mujoco.mj_forward(m, d)
-        # MuJoCo >= 3.0 去掉了 data.qM，mj_fullM 改为 (model, data, dst) 签名
-        mujoco.mj_fullM(m, d, M)
+        # mj_fullM(model, dst, sparse_M)：从 mj_forward 更新的 qM 展开质量矩阵。
+        mujoco.mj_fullM(m, M, d.qM)
 
         Jc = np.zeros((12, m.nv))
         for leg, bid in enumerate(foot_ids):

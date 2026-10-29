@@ -4,6 +4,7 @@
 #include "custom_types.h"
 #include <cstdio>
 #include <functional>
+#include <sys/select.h>
 #include <termios.h>
 
 #define AXIS_STEP 0.1
@@ -76,13 +77,15 @@ public:
         double turnning_time_record = GetCurrentTimeStamp();
         std::cout << "Start Keyboard Listening" << std::endl;
         while (start_thread_flag_) {
-            // std::cout << "time: " << current_time << " " << forward_time_record << std::endl;
-            std::cout << "[Keyboard] Running..." << std::endl;
-            if(read(STDIN_FILENO, &input, 1) != -1){
-                double current_time = GetCurrentTimeStamp();
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(STDIN_FILENO, &read_fds);
+            timeval timeout{0, 10000};  // 10 ms：允许无按键时也及时更新速度命令
+            const int ready = select(STDIN_FILENO + 1, &read_fds, nullptr, nullptr, &timeout);
+            const double current_time = GetCurrentTimeStamp();
+            if (ready > 0 && FD_ISSET(STDIN_FILENO, &read_fds) && read(STDIN_FILENO, &input, 1) == 1) {
                 // std::lock_guard<std::mutex> lock(mtx_);  // 修改 usr_cmd_ 和读取 msfb_
 
-                std::cout << "input: " << input << std::endl;
                 if(input == 'r'){
                     usr_cmd_.target_mode = int(RobotMotionState::JointDamping);
                 }
@@ -133,10 +136,6 @@ public:
                         }
 
 
-                        if(current_time - forward_time_record > 300.) usr_cmd_.forward_vel_scale = 0;
-                        if(current_time - side_time_record > 300.) usr_cmd_.side_vel_scale = 0;
-                        if(current_time - turnning_time_record > 300.) usr_cmd_.turnning_vel_scale = 0;
-
                         ClipNumber(usr_cmd_.forward_vel_scale, -1., 1.);
                         ClipNumber(usr_cmd_.side_vel_scale, -1., 1.);
                         ClipNumber(usr_cmd_.turnning_vel_scale, -1., 1.);
@@ -145,10 +144,11 @@ public:
                         break;
                 }
             }
-            // std::this_thread::sleep_for(std::chrono::microseconds(100));
+            if(current_time - forward_time_record > 300.) usr_cmd_.forward_vel_scale = 0;
+            if(current_time - side_time_record > 300.) usr_cmd_.side_vel_scale = 0;
+            if(current_time - turnning_time_record > 300.) usr_cmd_.turnning_vel_scale = 0;
         }
         tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
     }
 
 };
-

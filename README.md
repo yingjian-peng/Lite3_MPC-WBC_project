@@ -24,7 +24,7 @@ flowchart LR
     G --> D
 ```
 
-仿真与真机共用关节命令格式：每个关节发送 `kp、目标位置、kd、目标速度、前馈力矩`。后续 ONNX 与 MPC+WBC 控制线程只能选择其中一条写入关节命令，状态切换仍由现有状态机管理。
+仿真控制统一由 `build/mpc_control` 启动。默认使用 ONNX；设置 `LITE3_CONTROL_PATH=mpc_wbc` 则使用 MPC+WBC。两种控制器共用状态机、键盘命令和关节命令接口，每次运行只构造所选控制器。
 
 ## 3. 工程结构
 
@@ -54,7 +54,7 @@ Lite3_MPC-WBC_project/
 
 ## 4. 运行 MuJoCo 仿真
 
-环境：Ubuntu、CMake、C++17 编译器、Python 3，以及 `backward.hpp` 和 `libdw-dev`。项目的 Eigen、ONNX Runtime、Lite3 MotionSDK 等 C++ 依赖位于 `support/third_party/`。安装 Python 仿真依赖：
+环境：Ubuntu、CMake、C++17 编译器、Python 3，以及 `backward.hpp` 和 `libdw-dev`。项目的 Eigen 和 ONNX Runtime 等 C++ 依赖位于 `support/third_party/`。安装 Python 仿真依赖：
 
 ```bash
 python3 -m pip install mujoco colorama "numpy<2"
@@ -63,50 +63,9 @@ python3 -m pip install mujoco colorama "numpy<2"
 在工程根目录构建仿真控制程序：
 
 ```bash
-cmake -S . -B build -DBUILD_PLATFORM=x86 -DBUILD_SIM=ON -DSEND_REMOTE=OFF
+cmake -S . -B build
 cmake --build build -j
 ```
-
-### MPC+WBC 开发对表（可选）
-
-MPC+WBC 算法位于 `mpc_wbc/`，当前已完成运动学（FK/IK/雅可比）、全身动力学（`M/h/Jc`）、trot 步态/足端轨迹、位置环基线（S4）、状态估计（S5）、SRBD 预测时域 MPC（S6）、统一 Weighted-QP WBC（S7，含自研内点法 QP 求解器）与控制器编排（S8：`mpc_wbc/05_mpc_wbc_controller.hpp` + `state_machine/mpc_control_state.hpp`，MPC 独立线程、命令平滑/滞回/安全退化已在 MuJoCo 闭环验证；trot 行走稳定性作为 S9 第一项继续）。开启对表测试后可用 CTest 跑 MuJoCo 数值对照（需要 `python3` 与 `mujoco`）：
-
-```bash
-cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON
-cmake --build build -j
-cd build && ctest -R mpc_wbc --output-on-failure
-```
-
-SRBD-MPC 离线自检（不需要 MuJoCo）：
-
-```bash
-cmake -S . -B build -DBUILD_MPC_WBC_TESTS=ON
-cmake --build build -j
-mpc_wbc/test/run_srbd_mpc_test.sh
-```
-
-Weighted-QP WBC 离线自检 + MuJoCo 正动力学复核（自研 QP 单测 → WBC 自检 → 把解回灌 MuJoCo）：
-
-```bash
-mpc_wbc/test/run_wbc_test.sh
-```
-
-位置环跑步基线（无头仿真 + 自动分析）：
-
-```bash
-cmake -S . -B build -DBUILD_MPC_WBC_SIM=ON
-cmake --build build -j
-mpc_wbc/test/run_s4_position_loop.sh 24
-```
-
-控制器编排（S8）离线自检（不需要 MuJoCo）与整机闭环（站立/行走 harness）：
-
-```bash
-mpc_wbc/test/run_s8_mpc_wbc.sh            # 离线 8 段确定性自检
-mpc_wbc/test/run_s8_mpc_wbc.sh stand      # + 站立保持 20 s（MuJoCo 闭环）
-```
-
-`BUILD_MPC_WBC_TESTS` 默认关闭，不影响上面的 ONNX 仿真/真机构建。详见 [mpc_wbc/README.md](mpc_wbc/README.md) 与 [MPC+WBC 实现步骤与里程碑](docs/04_Lite3_MPC_WBC实现步骤与里程碑.md)。
 
 分别在两个终端运行：
 
@@ -116,55 +75,37 @@ python3 interface/robot/simulation/mujoco_simulation.py
 ```
 
 ```bash
-# 终端 2：从 build/ 目录启动当前 ONNX 控制程序
-cd build
-./rl_deploy
+# 终端 2：使用默认 ONNX 控制器
+./build/mpc_control
 ```
-
-控制程序当前通过运行目录定位 `onnx/policy/ppo/policy.onnx`，因此上述 `cd build` 不应省略。MuJoCo 加载的平地场景为 `robot_models/robots/Lite3/Lite3_mjcf/mjcf/Lite3_flat.xml`。
 
 要用 MPC+WBC 走状态机路径（与 ONNX **互斥**，选 MPC 时不会构造 ONNX 状态，因此不需要 `policy.onnx`）：
 
 ```bash
-# 终端 2
-cd build
-LITE3_CONTROL_PATH=mpc_wbc ./rl_deploy
+# 终端 2：选择 MPC+WBC 控制器
+LITE3_CONTROL_PATH=mpc_wbc ./build/mpc_control
 ```
 
-按键语义不变（`z` 站起 → `c` 进入运动控制 → `w/a/s/d/q/e` 速度命令 → `x` 趴下 / `r` 阻尼）。当前状态：起立→接管→站立、前进、超限自动切阻尼均已在仿真验证；trot 长时间行走仍不稳（见 [mpc_wbc/README.md](mpc_wbc/README.md) 的 S8 边界，S9 第一项）。其他 MPC+WBC 参数可用 `MPC_WBC_*` 环境变量覆盖（见 `state_machine/mpc_control_state.hpp`）。
+仿真默认开启 MuJoCo viewer。不要设置 `MUJOCO_VIEWER=0`。仿真端和控制端分别运行，两个终端都应留在前台。
 
-### 5. 当前 ONNX 控制按键
+### 5. 键盘控制
 
-仿真程序检测到 `/dev/input/js0` 时使用 Xbox 手柄，否则使用键盘。
+仿真构建使用键盘接口。启动控制程序的终端需要保持焦点，按键后松开即可；速度命令在约 300 ms 后自动归零。
 
-| 功能 | 键盘 | Xbox 手柄 |
-| --- | --- | --- |
-| 站起 | `z` | LB |
-| 进入当前 ONNX 控制 | `c` | RB |
-| 趴下 | `x` | X |
-| 关节阻尼 | `r` | LT |
-| 前进 / 后退 | `w` / `s` | 左摇杆上下 |
-| 左右平移 | `a` / `d` | 左摇杆左右 |
-| 原地旋转 | `q` / `e` | 右摇杆左右 |
+| 功能 | 按键 |
+| --- | --- |
+| 站起 | `z` |
+| 进入当前所选控制器（ONNX 或 MPC+WBC） | `c` |
+| 趴下 | `x` |
+| 关节阻尼 | `r` |
+| 前进 / 后退 | `w` / `s` |
+| 左右平移 | `a` / `d` |
+| 原地旋转 | `q` / `e` |
 
-先站起，再进入 ONNX 控制状态，随后发送速度命令。上述按键属于当前 ONNX 基线；MPC+WBC 接入后计划复用相同的运动命令入口。
-
-## 6. 真机构建
-
-真机路径使用 Lite3 MotionSDK，默认输入为 Retroid 手柄。ARM 构建需要相应的 `aarch64-linux-gnu` 编译器及库：
-
-```bash
-cmake -S . -B build -DBUILD_PLATFORM=arm -DBUILD_SIM=OFF -DSEND_REMOTE=OFF
-cmake --build build -j
-cd build
-./rl_deploy
-```
-
-Retroid 手柄：Y 站起、A 进入当前 ONNX 控制、X 趴下、同时按下左右摇杆进入阻尼；左摇杆控制平移，右摇杆控制转向。真机运行前需核对网络配置、SDK 控制权、关节顺序、传感器单位和关节限幅。本 README 中的真机构建步骤描述现有接口，**不表示 MPC+WBC 已完成真机部署**。
-
+仿真初始姿态为站立位。按 `z` 进入站立状态，站稳后按 `c` 启用本次启动选择的控制器，再用方向键控制运动。按 `r` 可切换到关节阻尼状态。
 
 各文件职责和模块关系见 [工程结构与文件说明](docs/01_project_structure.md)。模型说明见 [robot_models/README.md](robot_models/README.md)。
 
-## 7. 来源与许可
+## 6. 来源与许可
 
 本工程基于云深处的 [Lite3_rl_deploy](https://github.com/DeepRoboticsLab/Lite3_rl_deploy) 整理。源码许可见 [LICENSE](LICENSE)。

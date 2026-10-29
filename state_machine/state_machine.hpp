@@ -19,17 +19,17 @@
 #include "rl_control_state_onnx.hpp"
 #include "mpc_control_state.hpp"
 
-#include "skydroid_gamepad_interface.hpp"
-#include "retroid_gamepad_interface.hpp"
-#include "keyboard_interface.hpp"
-#include "xbox_gamepad_interface.hpp"
 #include <fcntl.h>
 #include <unistd.h>
 #ifdef BUILD_SIMULATION
+    #include "keyboard_interface.hpp"
     #include "simulation/simulation_interface.hpp"
+ #else
+    #include "skydroid_gamepad_interface.hpp"
+    #include "retroid_gamepad_interface.hpp"
+    #include "xbox_gamepad_interface.hpp"
+    #include "hardware/hardware_interface.hpp"
 #endif
-
-#include "hardware/hardware_interface.hpp"
 #include "data_streaming.hpp"
 
 class StateMachine{
@@ -110,17 +110,8 @@ private:
 public:
     StateMachine(RobotType robot_type){
         #ifdef BUILD_SIMULATION
-            // 检测Xbox手柄是否存在
-            std::string js_device = "/dev/input/js0";
-            int js_fd = open(js_device.c_str(), O_RDONLY);
-            if(js_fd >= 0){
-                close(js_fd);
-                std::cout << "Xbox gamepad detected, using XboxGamepadInterface" << std::endl;
-                uc_ptr_ = std::make_shared<XboxGamepadInterface>(js_device);
-            } else {
-                std::cout << "No Xbox gamepad detected, using KeyboardInterface" << std::endl;
-                uc_ptr_ = std::make_shared<KeyboardInterface>();
-            }
+            std::cout << "Simulation input: KeyboardInterface" << std::endl;
+            uc_ptr_ = std::make_shared<KeyboardInterface>();
         #else
             uc_ptr_ = std::make_shared<RetroidGamepadInterface>(12121);
         #endif
