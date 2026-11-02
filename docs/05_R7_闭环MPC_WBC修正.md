@@ -1,6 +1,10 @@
 
 ---
 
+> **注意（2026-11-02）**：本文的 `r7_fwd_sweep.csv` / `r7_back_sweep.csv` 与
+> `sweep_gait_params.py` 已从 `mpc_wbc/test` 清理，文中命令不能再直接执行；
+> 现役脚本与场景见 [mpc_wbc/test/README.md](../mpc_wbc/test/README.md)。
+
 ## 2026-10-22 R7：对照 `legged_control` 修正 MPC+WBC，闭环包线从 0.05 m/s 拓到 ±0.45（前程到 0.60）
 
 本轮先下载了参考工程 `legged_control`（legged_wbc / legged_interface 的 OCS2 SLQ 实现）

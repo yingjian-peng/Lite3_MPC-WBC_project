@@ -1,5 +1,0 @@
-phase,duration,vx,vy,wz
-xy_pn_raw,10.0,0.60,-0.35,0.0
-stop_xy_pn_raw,2.0,0.0,0.0,0.0
-xy_nn_raw,10.0,-0.60,-0.35,0.0
-stop_xy_nn_raw,2.0,0.0,0.0,0.0

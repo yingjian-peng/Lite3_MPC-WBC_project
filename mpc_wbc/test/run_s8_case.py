@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """跑一个 MPC+WBC（S8）场景：起仿真 → 跑控制器 → 收仿真。
 
-与 sweep_gait_params.py 的区别：这里是 `mpc_wbc_mpc_wbc_sim`（估计 → 步态 →
-SRBD-MPC → WBC），用于 R6/R7 的闭环迭代；命令来自 S8_PHASES（stand/walk/场景文件）。
+这里是 `mpc_wbc_mpc_wbc_sim`（估计 → 步态 → SRBD-MPC → WBC）的唯一驱动脚本，
+`run_acceptance.sh` / `run_single_axis.sh` / `robustness_closed_loop.py` 都调它。
+命令来自 S8_PHASES（stand/walk/场景文件）。
 
 用法：
     python3 mpc_wbc/test/run_s8_case.py --outdir build/r6/walk --phases walk
