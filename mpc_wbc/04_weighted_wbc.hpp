@@ -27,7 +27,7 @@
  *   ④ 摆动腿关节接近名义站姿（`w_posture`）
  *   ⑤ 力矩努力正则（`w_tau`，零空间性质，默认很小）
  *
- * 与低层执行律的关系（docs/04 S7 的风险项）：仿真/真机的关节命令是
+ * 与低层执行律的关系（docs/04 S7 的风险项）：仿 真里的关节命令是
  *   τ_applied = kp·(q_des − q) + kd·(dq_des − dq) + tau_ff
  * 若要把 WBC 的 τ 真正作用到机器人上，必须用**同一帧实测 q,dq** 反解
  *   tau_ff = τ_wbc − kp·(q_des − q) − kd·(dq_des − dq)
@@ -110,7 +110,7 @@ struct WbcParams {
     double mu = 0.6;                 // 摩擦系数
     double tau_max = 30.0;           // 关节力矩限幅 N·m（MuJoCo ctrlrange ±30）
     double foot_force_max = 200.0;   // 单脚法向力上限 N（≤0 关闭该约束）
-    double gravity = 9.81;           // 重力加速度（沿世界系 −z）；接入 S8 时与仿真/真机统一
+    double gravity = 9.81;           // 重力加速度（沿世界系 −z）；接入 S8 时与仿真统一
     double contact_accel_max = 200.0;  // 接触加速度目标限幅（防任务 PD 爆冲）[m/s²]
     // 支撑足**速度**阻尼 [1/s]。默认 0 = 只约束足端加速度为零（旧行为）。
     //

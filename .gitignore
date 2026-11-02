@@ -8,9 +8,10 @@ __pycache__/
 # 原来的 `.legged_control` 带了前导点，与实际目录名 `legged_control` 不匹配，等于没忽略。
 /legged_control/
 # WBC 单测导出的 MuJoCo 复核用例（生成物）
-wbc_mujoco_cases.csv
+mpc_wbc/test/wbc_mujoco_cases.csv
 
-mpc_wbc/test
+# 注意：不要整目录忽略 mpc_wbc/test —— 场景 CSV 与验收脚本（run_acceptance.sh、
+# analyze_axis_sweep.py、scenarios/*.csv）是复现 docs/00 §5 数字的必需品，必须入库。
 support/third_party/libtorch
 support/third_party/x30_motion_sdk
 **/tmp/*
