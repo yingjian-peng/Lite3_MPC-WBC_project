@@ -46,7 +46,6 @@ Lite3_MPC-WBC_project/
 ├── support/                       相对固定的共用与外部支持文件
 │   ├── types/                     共用数据类型
 │   ├── utils/                     数学工具与遥测
-│   ├── scripts/                   真机文件传输脚本
 │   └── third_party/               Eigen、ONNX Runtime、手柄库与 Lite3 SDK
 └── docs/                          工程结构和维护文档
 ```
