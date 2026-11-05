@@ -3,7 +3,7 @@
 
 > **注意（2026-11-02）**：本文的 `r7_fwd_sweep.csv` / `r7_back_sweep.csv` 与
 > `sweep_gait_params.py` 已从 `mpc_wbc/test` 清理，文中命令不能再直接执行；
-> 现役脚本与场景见 [mpc_wbc/test/README.md](../mpc_wbc/test/README.md)。
+> 独立调参程序和验收工具现已全部删除，本文仅保留历史修正过程。
 
 ## 2026-10-22 R7：对照 `legged_control` 修正 MPC+WBC，闭环包线从 0.05 m/s 拓到 ±0.45（前程到 0.60）
 
@@ -27,7 +27,7 @@
 
 ### 五个关键修复
 
-1. **摆动任务补 `− J̇q̇`**（`04_weighted_wbc.hpp`）。足端加速度是 `a = J q̈ + J̇q̇`，
+1. **摆动任务补 `− J̇q̇`**（`06_weighted_wbc.hpp`）。足端加速度是 `a = J q̈ + J̇q̇`，
    漏掉这一项任务目标会偏一个与向心/科氏同量级的量，表现正是此前实测的
    「命令净空 0.10 m、实际只有 0.045 m，FL/HR 有 85–90% 的摆动时间在拖地」。
 2. **权重比改为 `w_base=1.0 / w_swing=100`**，摆动增益对齐 `kp=350 / kd=37`。

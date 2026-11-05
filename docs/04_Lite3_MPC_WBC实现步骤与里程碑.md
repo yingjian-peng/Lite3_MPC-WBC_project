@@ -4,7 +4,7 @@
 >
 > **本文已归档（2026-11-02）**：MPC+WBC 闭环已完成并定稿（见 [00_设计指标](00_设计指标.md)），
 > 本文描述的施工步骤与 `run_s4_position_loop.sh` / `run_s9_ab.sh` 等脚本均已从
-> `mpc_wbc/test` 清理，现役工具见 [mpc_wbc/test/README.md](../mpc_wbc/test/README.md)。
+> `mpc_wbc/test` 清理。独立调参程序和验收工具现已全部删除，本文保留历史记录，文中命令不再适用于当前工程。
 
 ## 1. 当前判断与目标
 

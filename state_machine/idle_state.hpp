@@ -17,15 +17,13 @@ class IdleState : public StateBase{
 private:
     bool joint_normal_flag_ = false, imu_normal_flag_ = false;
     bool first_enter_flag_ = true;
-    VecXf joint_pos_, joint_vel_, joint_tau_;
+    VecXf joint_pos_, joint_vel_;
     Vec3f rpy_, acc_, omg_;
     double enter_state_time_ = -10000.;
-
-    float last_print_time = 0;
+    double last_health_warning_time_ = -1.0;
     void GetProprioceptiveData(){
         joint_pos_ = ri_ptr_->GetJointPosition();
         joint_vel_ = ri_ptr_->GetJointVelocity();
-        joint_tau_ = ri_ptr_->GetJointTorque();
         rpy_ = ri_ptr_->GetImuRpy();
         acc_ = ri_ptr_->GetImuAcc();
         omg_ = ri_ptr_->GetImuOmega();
@@ -55,39 +53,16 @@ private:
     bool ImuDataNormalCheck(){
         for(int i=0;i<3;++i){
             if(std::isnan(rpy_(i)) || fabs(rpy_(i)) > M_PI){
-                std::cout << "rpy_ " << i << " : " << rpy_(i) << std::endl;
                 return false;
             } 
             if(std::isnan(omg_(i)) || fabs(omg_(i)) > M_PI){
-                std::cout << "omg_ " << i << " : " << omg_(i) << std::endl;
                 return false;
             }
         }
         if(acc_.norm() < 0.1*gravity || acc_.norm() > 3.0*gravity){
-            std::cout << "acc " << " : " << acc_.transpose() << std::endl;
             return false;
         }
         return true;
-    }
-
-    void DisplayProprioceptiveInfo(){
-        std::cout << "Joint Data: \n";
-        std::cout << "pos: " << joint_pos_.transpose() << std::endl;
-        std::cout << "vel: " << joint_vel_.transpose() << std::endl;
-        std::cout << "tau: " << joint_tau_.transpose() << std::endl;
-        std::cout << "Imu Data: \n";
-        std::cout << "rpy: " << rpy_.transpose() << std::endl;
-        std::cout << "acc: " << acc_.transpose() << std::endl;
-        std::cout << "omg: " << omg_.transpose() << std::endl;
-    }
-
-    void DisplayAxisValue(){
-        auto cmd = uc_ptr_->GetUserCommand();
-        std::cout << "User Command Input: \n";
-        std::cout << "axis value:  " << cmd.forward_vel_scale << " " 
-                                     << cmd.side_vel_scale << " "
-                                     << cmd.turnning_vel_scale << std::endl;
-        std::cout << "target mode: " << cmd.target_mode << std::endl;
     }
 
 
@@ -110,11 +85,6 @@ public:
         GetProprioceptiveData();
         joint_normal_flag_ = JointDataNormalCheck();
         imu_normal_flag_ = ImuDataNormalCheck();
-        if (((ri_ptr_->GetInterfaceTimeStamp() - last_print_time) > 1)) {
-                DisplayProprioceptiveInfo();
-                DisplayAxisValue();
-                last_print_time = ri_ptr_->GetInterfaceTimeStamp();
-            }
         MatXf cmd = MatXf::Zero(12, 5);
         ri_ptr_->SetJointCommand(cmd); // (current torque, not last torque, video content slip of the tongue)
     }
@@ -127,7 +97,12 @@ public:
         // std::cout << "Current target_mode = " << uc_ptr_->GetUserCommand().target_mode << std::endl;
 
         if(!joint_normal_flag_ || !imu_normal_flag_) {
-            std::cout << "joint status: " << joint_normal_flag_ << " | imu status: " << imu_normal_flag_ << std::endl;
+            const double now = ri_ptr_->GetInterfaceTimeStamp();
+            if (now - last_health_warning_time_ >= 1.0) {
+                std::cerr << "Waiting for stand: sensor data invalid (joint="
+                          << joint_normal_flag_ << ", imu=" << imu_normal_flag_ << ")" << std::endl;
+                last_health_warning_time_ = now;
+            }
             return StateName::kIdle;
         }
         if(first_enter_flag_ && ri_ptr_->GetInterfaceTimeStamp() - enter_state_time_ < 0.5){

@@ -1,23 +1,15 @@
-/**
+/*===============================================================================================
  * @file mpc_control_state.hpp
- * @brief S8 MPC+WBC 控制状态（对应 docs/04 §3 阶段 D）。
- *
- * 线程分工（实测结论，见 docs/04 §8 S8）：
- *   - **主线程 / 1 kHz**（`Run()`，由 `StateMachine::Run()` 在接口时间戳前进时调用）：
- *     读测量 → `BuildMpcRequest`（纯赋值）→ 读最近一次 wrench 快照 → `Step` 算 12×5 命令
- *     → `SetJointCommand`。这条路径**唯一**写关节命令，且实测单帧 p99 < 0.6 ms。
- *   - **MPC 工作线程**：只解 SRBD-MPC（盒约束 QP，偶发 10~30 ms 抖动），结果写进序列锁快照。
- *     放在主线程里会让 1 kHz 的 WBC 漏拍、行走失稳（实测 trot 段 4 s 后 tilt 发散）。
- *
- * 进出约束（docs/04 §3 S8 通过条件）：
- *   - `OnEnter` 先复位控制器并记录起始关节角；`OnExit` **先 join 工作线程**再放开命令写权，
- *     保证「无双写、无陈旧命令」。
- *   - 进入前机器人应由 `StandUpState` 站好（本状态的斜坡只是平滑接管，不负责从趴地起立）。
- */
+ * @brief MPC+WBC 状态适配：连接状态机、仿真接口与 07 核心控制器
+ * @details 主线程在收到新测量时发布 MPC 请求、读取最近参考、计算并发送关节命令。
+ * MPC 工作线程只求解 SRBD-MPC，通过快照发布结果，不读写机器人接口。
+ * OnEnter 在站立完成后复位并启动求解线程；OnExit 停止并回收线程。
+ * 本状态负责按键切换和失控转阻尼，具体运动控制由 MpcWbcController 实现。
+ ===============================================================================================*/
 #pragma once
 
 #include "state_base.h"
-#include "05_mpc_wbc_controller.hpp"
+#include "07_mpc_wbc_controller.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -26,33 +18,30 @@
 
 class MPCControlState final : public StateBase {
 public:
-    MPCControlState(const RobotType& robot_type, const std::string& state_name,
-                    std::shared_ptr<ControllerData> data_ptr)
+    MPCControlState(const RobotType& robot_type, const std::string& state_name, std::shared_ptr<ControllerData> data_ptr)
         : StateBase(robot_type, state_name, data_ptr), controller_(LoadParams()),
-          mpc_worker_(&controller_, controller_.params().mpc_period) {
+          mpc_worker_(&controller_, controller_.params().mpc_period) 
+    {
         std::printf("[mpc_wbc] 站立：基座高度=%.4f m，质心高度=%.4f m；pd_scale=%.2f "
                     "w_base=%.0f w_swing=%.0f mpc_period=%.3f\n",
                     controller_.stand_base_height(), controller_.stand_com_height(),
                     controller_.params().kp_scale_wbc, controller_.params().wbc.w_base,
                     controller_.params().wbc.w_swing, controller_.params().mpc_period);
     }
-
-    ~MPCControlState() { StopWorker(); }
+    ~MPCControlState() { mpc_worker_.Stop(); }
 
     void OnEnter() override {
         const double t = ri_ptr_->GetInterfaceTimeStamp();
         const mpc_wbc::Vec12d q = ri_ptr_->GetJointPosition().cast<double>();
         controller_.Reset(t, q);
         last_run_t_ = t;
-        started_ = true;
         mpc_worker_.Start();
-        StateBase::msfb_.UpdateCurrentState(RobotMotionState::RLControlMode);
+        StateBase::msfb_.UpdateCurrentState(RobotMotionState::MPCControlMode);
         uc_ptr_->SetMotionStateFeedback(StateBase::msfb_);
     }
 
     void OnExit() override {
-        StopWorker();   // 先停并回收工作线程，再交出命令写权（避免线程里还持有 SetJointCommand 的所有权）
-        started_ = false;
+        mpc_worker_.Stop();   // 退出 MPC 状态前停止并回收求解线程；关节命令始终由主线程发送
     }
 
     void Run() override {
@@ -75,7 +64,6 @@ public:
         if (!mpc_worker_.wrenches.Read(&wrench)) wrench = controller_.wrench();
 
         const mpc_wbc::ControllerOutput out = controller_.Step(in, wrench);
-        last_output_ = out;
         ri_ptr_->SetJointCommand(out.joint_cmd);
 
         if (ds_ptr_) {
@@ -106,12 +94,8 @@ public:
     StateName GetNextStateName() override {
         if (uc_ptr_->GetUserCommand().target_mode == int(RobotMotionState::LieDown))
             return StateName::kLieDown;
-        return StateName::kRLControl;   // 首版沿用数值 6 与按键语义（docs/04 §7 第 4 项）
+        return StateName::kMPCControl;
     }
-
-    /// 诊断（供日志/测试）。
-    const mpc_wbc::ControllerOutput& last_output() const { return last_output_; }
-    int mpc_solve_count() const { return mpc_worker_.solve_count(); }
 
 private:
     static mpc_wbc::MpcWbcControllerParams LoadParams() {
@@ -130,19 +114,22 @@ private:
         return p;
     }
 
-    /// 用户命令 → 物理速度命令（沿用 ONNX 路径的 forward/side/turnning scale 语义）。
+    /// 用户命令 → 物理速度命令（沿用 ONNX 路径的 forward/side/turnning scale 语义）
     mpc_wbc::GaitCommand BuildGaitCommand() const {
         const auto cmd = uc_ptr_->GetUserCommand();
+        const auto& params = controller_.params();
+        mpc_wbc::GaitParams input_limits = params.gait;
+        if (params.use_gait_schedule) {
+            input_limits.max_vx = params.gait_schedule.max_vx;
+            input_limits.max_vy = params.gait_schedule.max_vy;
+            input_limits.max_wz = params.gait_schedule.max_wz;
+        }
         return mpc_wbc::GaitTrajectory::ScaleCommand(
             mpc_wbc::Vec3d(cmd.forward_vel_scale, cmd.side_vel_scale, cmd.turnning_vel_scale),
-            controller_.params().gait);
+            input_limits);
     }
 
-    void StopWorker() { mpc_worker_.Stop(); }
-
     mpc_wbc::MpcWbcController controller_;
-    mpc_wbc::MpcWorkerThread mpc_worker_;   // 只解 MPC；1 kHz 路径不依赖它的完成
-    mpc_wbc::ControllerOutput last_output_;
+    mpc_wbc::MpcWorkerThread mpc_worker_;
     double last_run_t_ = 0.0;
-    bool started_ = false;
 };

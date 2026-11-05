@@ -1,9 +1,23 @@
 import os
+import sys
 import time
 import socket
 import struct
 import threading
 from pathlib import Path
+
+# Linux 查看器在后台线程使用 X11；必须在加载图形库前启用 Xlib 线程支持。
+if sys.platform.startswith("linux") and os.environ.get("DISPLAY"):
+    import ctypes
+    import ctypes.util
+    _x11_path = ctypes.util.find_library("X11")
+    if _x11_path:
+        _x11 = ctypes.CDLL(_x11_path)
+        _x11.XInitThreads.argtypes = []
+        _x11.XInitThreads.restype = ctypes.c_int
+        if _x11.XInitThreads() == 0:
+            raise RuntimeError("XInitThreads failed: cannot safely start the MuJoCo viewer")
+
 import numpy as np
 import mujoco
 import mujoco.viewer
@@ -47,6 +61,17 @@ SIM_INIT_HEIGHT = float(os.environ.get("SIM_INIT_HEIGHT", str(STAND_BASE_HEIGHT)
 FOOT_BODY_NAMES = ("FL_FOOT", "FR_FOOT", "HL_FOOT", "HR_FOOT")
 kNumFeet = len(FOOT_BODY_NAMES)
 
+# 足端世界坐标轨迹：每 10 ms 采样，保留最近 1.8 s；线宽单位为像素。
+FOOT_TRACE_MAX_POINTS = 180
+FOOT_TRACE_SAMPLE_STRIDE = 10
+FOOT_TRACE_LINE_WIDTH = 3.0
+FOOT_TRACE_COLORS = np.array([
+    [1.00, 0.18, 0.12, 0.95],  # FL：红色，左前腿
+    [0.10, 0.42, 1.00, 0.95],  # FR：蓝色，右前腿
+    [0.15, 0.85, 0.25, 0.95],  # HL：绿色，左后腿
+    [1.00, 0.82, 0.12, 0.95],  # HR：黄色，右后腿
+], dtype=np.float32)
+
 class MuJoCoSimulation:
     def __init__(self, model_key: str = MODEL_NAME, 
                  xml_relpath: str = XML_PATH,
@@ -60,6 +85,10 @@ class MuJoCoSimulation:
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.recv_sock.bind(("0.0.0.0", local_port))
         self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.recv_sock.settimeout(0.1)  # 定期检查退出标志，避免接收线程永久阻塞。
+        self._stop_event = threading.Event()
+        self._recv_thread = None
+        self._log_file = None
 
         # Load MJCF
         xml_full = str(Path(__file__).resolve().parent / xml_relpath)
@@ -148,6 +177,15 @@ class MuJoCoSimulation:
         self.last_print_time = 0  # Track last print time
         self._foot_body_to_leg = None  # 足端 body id → 腿序号（首次写日志时构建）
 
+        # 只在可视化时记录轨迹；有限长度缓存避免长时间运行时持续占用内存。
+        self.foot_body_ids = [
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            for name in FOOT_BODY_NAMES
+        ]
+        if any(body_id < 0 for body_id in self.foot_body_ids):
+            raise ValueError(f"Cannot find all foot bodies: {FOOT_BODY_NAMES}")
+        self.foot_trace_points = [[] for _ in FOOT_BODY_NAMES]
+
         print(f"[INFO] MuJoCo model loaded, dof = {self.dof_num}")
 
         # Visualization
@@ -161,6 +199,37 @@ class MuJoCoSimulation:
         self.viewer.cam.azimuth = 135
         self.viewer.cam.elevation = -18
         self.viewer.cam.lookat[:] = np.array([0.4, 0.0, 0.45])
+
+    def _record_foot_trace(self, step: int):
+        """按固定仿真步间隔，保存四个足端中心的世界坐标。"""
+        if self.viewer is None or step % FOOT_TRACE_SAMPLE_STRIDE != 0:
+            return
+        for trace, body_id in zip(self.foot_trace_points, self.foot_body_ids):
+            trace.append(self.data.xpos[body_id].copy())
+            if len(trace) > FOOT_TRACE_MAX_POINTS:
+                del trace[:-FOOT_TRACE_MAX_POINTS]
+
+    def _draw_foot_traces(self):
+        """更新查看器自定义线段；调用方持有 viewer.lock()，旧轨迹逐渐变淡。"""
+        if self.viewer is None:
+            return
+        scene = self.viewer.user_scn
+        scene.ngeom = 0  # 自定义场景由足端轨迹独占，不修改模型中的碰撞几何体。
+        zero = np.zeros(3, dtype=np.float64)
+        identity = np.eye(3, dtype=np.float64).reshape(-1)
+        for leg_index, trace in enumerate(self.foot_trace_points):
+            color = FOOT_TRACE_COLORS[leg_index].copy()
+            for point_index in range(1, len(trace)):
+                if scene.ngeom >= scene.maxgeom:
+                    return
+                color[3] = 0.20 + 0.75 * point_index / (len(trace) - 1)
+                geom = scene.geoms[scene.ngeom]
+                mujoco.mjv_initGeom(
+                    geom, mujoco.mjtGeom.mjGEOM_LINE, zero, zero, identity, color)
+                mujoco.mjv_connector(
+                    geom, mujoco.mjtGeom.mjGEOM_LINE, FOOT_TRACE_LINE_WIDTH,
+                    trace[point_index - 1], trace[point_index])
+                scene.ngeom += 1
 
     def _apply_model_overrides(self):
         """仿真层叠加执行器/足垫模型（**默认按本工程标定值开启**）。
@@ -227,6 +296,10 @@ class MuJoCoSimulation:
         self.data.qpos[:] = qpos0
         mujoco.mj_forward(self.model, self.data)
         self.qpos_hold = self.data.qpos[7:7+self.dof_num].copy().reshape(-1, 1)
+
+        # 复位后清空历史，避免新旧位置之间出现跨场景连线。
+        for trace in getattr(self, "foot_trace_points", ()):
+            trace.clear()
 
     def print_debug_info(self):
         """Consolidated function to print debug information with colors and aligned formatting."""
@@ -314,13 +387,37 @@ class MuJoCoSimulation:
         f.flush()
 
     def start(self):
+        """运行仿真；中断、关闭窗口、定时结束或异常时，统一释放资源。"""
+        try:
+            self._run()
+        finally:
+            self.close()
+
+    def close(self):
+        """先停止 UDP 接收，再关闭查看器和套接字；支持重复调用。"""
+        self._stop_event.set()
+        if self._recv_thread is not None:
+            self._recv_thread.join()
+            self._recv_thread = None
+        if self.viewer is not None:
+            self.viewer.close()
+            self.viewer = None
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+        self.recv_sock.close()
+        self.send_sock.close()
+
+    def _run(self):
         # Start UDP receiver thread
-        threading.Thread(target=self._udp_receiver, daemon=True).start()
+        self._recv_thread = threading.Thread(target=self._udp_receiver)
+        self._recv_thread.start()
         print(f"[INFO] UDP receiver on 0.0.0.0:{self.local_port}")
 
         log_f = None
         if SIM_LOG:
             log_f = open(SIM_LOG, "w")
+            self._log_file = log_f
             cols = (["t", "bx", "by", "bz", "qw", "qx", "qy", "qz",
                      "vx", "vy", "vz", "wx", "wy", "wz"]
                     + [f"q{i}" for i in range(self.dof_num)]
@@ -339,7 +436,9 @@ class MuJoCoSimulation:
         # Main simulation loop
         step = 0
         last_time = time.time()
-        while True:
+        while not self._stop_event.is_set():
+            if self.viewer is not None and not self.viewer.is_running():
+                return
             if time.time() - last_time >= DT:
                 last_time = time.time()
 
@@ -363,7 +462,10 @@ class MuJoCoSimulation:
                 if log_f is not None and step % SIM_LOG_EVERY == 0:
                     self._write_log(log_f)
                 # 可视化
+                self._record_foot_trace(step)
                 if self.viewer and step % RENDER_INTERVAL == 0:
+                    with self.viewer.lock():
+                        self._draw_foot_traces()
                     self.viewer.sync()
 
                 # Print at 0.5 Hz (every 2 seconds)
@@ -375,8 +477,6 @@ class MuJoCoSimulation:
 
                 if SIM_DURATION > 0 and self.timestamp >= SIM_DURATION:
                     print(f"[INFO] reached SIM_DURATION={SIM_DURATION}s, exiting")
-                    if log_f is not None:
-                        log_f.close()
                     return
                     
 
@@ -386,8 +486,11 @@ class MuJoCoSimulation:
         """
         fmt = f'{self.dof_num}f' * 5
         expected = struct.calcsize(fmt)
-        while True:
-            data, addr = self.recv_sock.recvfrom(expected)
+        while not self._stop_event.is_set():
+            try:
+                data, addr = self.recv_sock.recvfrom(expected)
+            except socket.timeout:
+                continue
             if len(data) < expected:
                 print(f"[WARN] UDP packet size {len(data)} != {expected}")
                 continue
@@ -471,5 +574,8 @@ class MuJoCoSimulation:
 
 
 if __name__ == "__main__":
-    sim = MuJoCoSimulation()
-    sim.start()
+    try:
+        sim = MuJoCoSimulation()
+        sim.start()
+    except KeyboardInterrupt:
+        print("\n[INFO] 仿真已停止")

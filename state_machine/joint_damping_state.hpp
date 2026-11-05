@@ -15,7 +15,6 @@
 
 class JointDampingState : public StateBase{
 private:
-    float time_record_, run_time_;
     MatXf joint_cmd_;
 public:
     JointDampingState(const RobotType& robot_type, const std::string& state_name, 
@@ -27,8 +26,6 @@ public:
     ~JointDampingState(){}
 
     virtual void OnEnter() {
-        time_record_ = ri_ptr_->GetInterfaceTimeStamp();
-        run_time_ = ri_ptr_->GetInterfaceTimeStamp();
         StateBase::msfb_.UpdateCurrentState(RobotMotionState::JointDamping);
         uc_ptr_->SetMotionStateFeedback(StateBase::msfb_);
     };
@@ -36,17 +33,14 @@ public:
 
     }
     virtual void Run() {
-        run_time_ = ri_ptr_->GetInterfaceTimeStamp();
         ri_ptr_->SetJointCommand(joint_cmd_); // (current torque, not last torque, video content slip of the tongue)
     }
     virtual bool LoseControlJudge() {
         return false;
     }
     virtual StateName GetNextStateName() {
-        if(run_time_ - time_record_ < 3.){
-            return StateName::kJointDamping;
-        }
-        return StateName::kIdle;
+        if(uc_ptr_->GetUserCommand().target_mode == int(RobotMotionState::StandingUp))
+            return StateName::kStandUp;
+        return StateName::kJointDamping;
     }
 };
-

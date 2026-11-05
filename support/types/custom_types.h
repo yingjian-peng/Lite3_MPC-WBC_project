@@ -15,6 +15,7 @@ namespace types{
         LieDown         = 3,
 
         RLControlMode   = 6,
+        MPCControlMode  = 7,
     };
 
     enum StateName{
@@ -25,6 +26,7 @@ namespace types{
         kLieDown      = 3,
 
         kRLControl    = 6,
+        kMPCControl   = 7,
     };
     
 

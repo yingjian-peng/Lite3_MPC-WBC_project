@@ -16,10 +16,8 @@ class KeyboardInterface : public UserCommandInterface
 {
 private:
     UserCommand usr_cmd_;
-    // MotionStateFeedback msfb_;
     bool start_thread_flag_;
     std::thread kb_thread_;
-    // std::mutex mtx_;  //  保护 usr_cmd_ 和 msfb_
     
     void ClipNumber(float &num, float low, float up){
         if(low > up) std::cerr << "error clip" << std::endl;
@@ -53,12 +51,10 @@ public:
         start_thread_flag_ = false;
     }
     virtual UserCommand GetUserCommand() override {
-        // std::lock_guard<std::mutex> lock(mtx_);
         return usr_cmd_;
     }
 
     virtual void SetMotionStateFeedback(const MotionStateFeedback& msfb){
-        // std::lock_guard<std::mutex> lock(mtx_);
         msfb_ = msfb;
         usr_cmd_.target_mode = msfb.current_state;
     }
@@ -84,13 +80,10 @@ public:
             const int ready = select(STDIN_FILENO + 1, &read_fds, nullptr, nullptr, &timeout);
             const double current_time = GetCurrentTimeStamp();
             if (ready > 0 && FD_ISSET(STDIN_FILENO, &read_fds) && read(STDIN_FILENO, &input, 1) == 1) {
-                // std::lock_guard<std::mutex> lock(mtx_);  // 修改 usr_cmd_ 和读取 msfb_
 
                 if(input == 'r'){
                     usr_cmd_.target_mode = int(RobotMotionState::JointDamping);
                 }
-                // usr_cmd_.down_shift = false;
-                // usr_cmd_.up_shift = false;
                 switch(msfb_.current_state) {
                     case RobotMotionState::WaitingForStand:
                         if(input=='z'){
@@ -100,18 +93,21 @@ public:
                     case RobotMotionState::StandingUp:
                         if(input=='c'){
                             usr_cmd_.target_mode = int(RobotMotionState::RLControlMode);
+                        }else if(input=='v' || input=='V'){
+                            usr_cmd_.target_mode = int(RobotMotionState::MPCControlMode);
                         }else if(input=='x' || input=='X'){
                             usr_cmd_.target_mode = int(RobotMotionState::LieDown);
                         }
                     break;
                     case RobotMotionState::RLControlMode:
+                    case RobotMotionState::MPCControlMode:
                         if(input=='x' || input=='X'){
                             usr_cmd_.target_mode = int(RobotMotionState::LieDown);
                         }
                         if(input=='w') {
                             usr_cmd_.forward_vel_scale+=AXIS_STEP;
                             forward_time_record = current_time;
-                        }  
+                        }
                         else if(input=='s') {
                             usr_cmd_.forward_vel_scale-=AXIS_STEP;
                             forward_time_record = current_time;
@@ -125,7 +121,7 @@ public:
                             usr_cmd_.side_vel_scale-=AXIS_STEP;
                             side_time_record = current_time;
                         }
-                        
+
                         if(input=='q') {
                             usr_cmd_.turnning_vel_scale+=AXIS_STEP;
                             turnning_time_record = current_time;
@@ -135,10 +131,14 @@ public:
                             turnning_time_record = current_time;
                         }
 
-
                         ClipNumber(usr_cmd_.forward_vel_scale, -1., 1.);
                         ClipNumber(usr_cmd_.side_vel_scale, -1., 1.);
                         ClipNumber(usr_cmd_.turnning_vel_scale, -1., 1.);
+                    break;
+                    case RobotMotionState::JointDamping:
+                        if(input=='z'){
+                            usr_cmd_.target_mode = int(RobotMotionState::StandingUp);
+                        }
                     break;
                     default:
                         break;
