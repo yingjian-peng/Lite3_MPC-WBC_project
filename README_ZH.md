@@ -123,9 +123,22 @@ stateDiagram-v2
     躺下 --> 等待站立: 躺下动作完成
 ```
 
-## 6. 来源与许可
+## 6. 技术文档
 
-- [OCS2经典控制框架] https://github.com/qiayuanl/legged_control
-- [云深处rl_deplay] https://github.com/DeepRoboticsLab/Lite3_rl_deploy
-- [机器狗MPC算法学习笔记] https://blog.csdn.net/wills9/article/details/119377036
+`docs/` 目录保留与当前代码实现一致的核心文档：
 
+| 文档 | 主要内容 |
+| --- | --- |
+| [00_Lite3 四足狗运动控制设计指标](<docs/00_Lite3 四足狗运动控制设计指标.md>) | 控制目标、速度范围、组合约束、稳定性指标、验收结果和工程边界 |
+| [01_Lite3 四足狗运动控制工程结构](<docs/01_Lite3 四足狗运动控制工程结构.md>) | 工程目录、进程与线程、状态机、算法分层、构建目标和文件职责 |
+| [03_基于 MPC+WBC 的四足狗运动控制理论与实现](docs/03_基于MPC+WBC的四足狗运动控制理论与实现.md) | 从 Lite3 运动学、动力学、步态和状态估计，到 SRBD-MPC、Weighted WBC 及工程集成的教材式说明 |
+
+建议首先阅读工程结构了解各模块位置，再阅读理论与实现文档，并使用设计指标核对参数范围与验收结果。
+
+## 7. 来源与许可
+
+- [OCS2 经典控制框架](https://github.com/qiayuanl/legged_control)
+- [云深处 Lite3 RL 部署工程](https://github.com/DeepRoboticsLab/Lite3_rl_deploy)
+- [四足机器人 MPC 算法学习笔记](https://blog.csdn.net/wills9/article/details/119377036)
+
+本工程的许可条款见 [LICENSE](LICENSE)。

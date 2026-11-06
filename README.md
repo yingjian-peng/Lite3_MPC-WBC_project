@@ -122,8 +122,22 @@ stateDiagram-v2
     LyingDown --> WaitingToStand: Lie-down motion complete
 ```
 
-## 6. References and Licensing
+## 6. Technical Documentation
+
+The `docs/` directory contains the core technical documents aligned with the current implementation. The documents are written in Chinese.
+
+| Document | Scope |
+| --- | --- |
+| [00 — Lite3 Locomotion Control Design Targets](<docs/00_Lite3 四足狗运动控制设计指标.md>) | Control objectives, velocity ranges, combined-command constraints, stability criteria, validation results, and project boundaries |
+| [01 — Lite3 Locomotion Control Project Structure](<docs/01_Lite3 四足狗运动控制工程结构.md>) | Repository layout, processes and threads, state machine, algorithm layers, build targets, and file responsibilities |
+| [03 — Quadruped Locomotion Control with MPC+WBC: Theory and Implementation](docs/03_基于MPC+WBC的四足狗运动控制理论与实现.md) | A textbook-style guide covering Lite3 kinematics, dynamics, gait generation, state estimation, SRBD-MPC, Weighted WBC, and system integration |
+
+For code study, start with the project structure, continue with the theory and implementation guide, and use the design targets to verify parameter ranges and recorded validation results.
+
+## 7. References and Licensing
 
 - [OCS2-based legged control framework](https://github.com/qiayuanl/legged_control)
 - [Deep Robotics RL deployment](https://github.com/DeepRoboticsLab/Lite3_rl_deploy)
 - [Quadruped MPC algorithm study notes (Chinese)](https://blog.csdn.net/wills9/article/details/119377036)
+
+See [LICENSE](LICENSE) for this project's licensing terms.
