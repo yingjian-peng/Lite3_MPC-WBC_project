@@ -1,0 +1,256 @@
+@page {
+  size: A4 portrait;
+}
+
+html {
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+body {
+  padding: 0 !important;
+  color: #20242a;
+  font-family: "Noto Serif CJK SC", "Source Han Serif SC", serif;
+  font-size: 10.5pt;
+  line-height: 1.72;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+body > h1:first-of-type {
+  max-width: 15em;
+  margin: 46mm auto 0;
+  padding: 0;
+  border: 0;
+  font-family: "Noto Sans CJK SC", sans-serif;
+  font-size: 24pt;
+  font-weight: 600;
+  line-height: 1.45;
+  text-align: center;
+}
+
+body > h1:first-of-type + p {
+  max-width: 35em;
+  margin: 18mm auto 0;
+  color: #4a5058;
+  font-size: 11pt;
+  line-height: 1.9;
+  text-align: justify;
+}
+
+.page {
+  height: 0;
+  break-after: page;
+  page-break-after: always;
+}
+
+h2,
+h3,
+h4 {
+  color: #172033;
+  font-family: "Noto Sans CJK SC", sans-serif;
+  font-weight: 600;
+  break-after: avoid-page;
+  page-break-after: avoid;
+}
+
+h2 {
+  margin: 0 0 1.1em;
+  padding: 0 0 0.42em;
+  border-bottom: 2px solid #365f91;
+  font-size: 20pt;
+  line-height: 1.35;
+}
+
+h3 {
+  margin: 1.25em 0 0.55em;
+  font-size: 14pt;
+  line-height: 1.45;
+}
+
+h4 {
+  margin: 1.05em 0 0.45em;
+  font-size: 11.5pt;
+  line-height: 1.5;
+}
+
+p {
+  margin: 0.45em 0 0.78em;
+  text-align: justify;
+  orphans: 3;
+  widows: 3;
+}
+
+a {
+  color: #285f9e;
+  text-decoration: none;
+}
+
+strong {
+  font-weight: 600;
+}
+
+ul,
+ol {
+  margin: 0.45em 0 0.85em;
+  padding-left: 1.7em;
+}
+
+li {
+  margin: 0.2em 0;
+}
+
+table {
+  width: 100%;
+  margin: 0.75em 0 1.05em;
+  border-collapse: collapse;
+  color: #20242a;
+  font-family: "Noto Sans CJK SC", sans-serif;
+  font-size: 8.7pt;
+  line-height: 1.48;
+  break-inside: auto;
+  page-break-inside: auto;
+}
+
+thead {
+  display: table-header-group;
+}
+
+tr {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+table > thead > tr > th,
+table > tbody > tr > td {
+  padding: 0.48em 0.58em !important;
+  vertical-align: top;
+  border: 1px solid #c8ced8 !important;
+}
+
+table > thead > tr > th {
+  color: #172033;
+  background: #eaf0f7;
+  font-weight: 600;
+}
+
+table > tbody > tr:nth-child(even) > td {
+  background: #f8fafc;
+}
+
+code {
+  font-family: "DejaVu Sans Mono", "Noto Sans Mono CJK SC", monospace;
+}
+
+:not(pre) > code {
+  padding: 0.08em 0.22em;
+  border-radius: 2px;
+  color: #704214 !important;
+  background: #f6f2eb;
+  font-size: 0.92em !important;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+table code {
+  padding: 0;
+  background: transparent;
+  font-size: 0.9em !important;
+}
+
+pre,
+pre:not(.hljs) {
+  margin: 0.75em 0 1em;
+  padding: 0.8em 1em !important;
+  border: 1px solid #d5dae2;
+  border-radius: 4px;
+  background: #f6f8fa !important;
+  font-size: 8.6pt;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  break-inside: avoid-page;
+  page-break-inside: avoid;
+}
+
+blockquote {
+  margin: 0.75em 0;
+  padding: 0.45em 0.9em;
+  border-left: 3px solid #7994b6;
+  background: #f5f7fa;
+  color: #454b54;
+}
+
+.katex-display {
+  margin: 0.65em 0 0.85em !important;
+  overflow: visible !important;
+  break-inside: avoid-page;
+  page-break-inside: avoid;
+}
+
+.katex-display > .katex {
+  max-width: 100%;
+  font-size: 0.96em;
+}
+
+.mermaid {
+  margin: 1em auto 1.15em !important;
+  text-align: center;
+  break-inside: avoid-page;
+  page-break-inside: avoid;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+}
+
+.mermaid svg {
+  display: block;
+  max-width: 100% !important;
+  max-height: 178mm;
+  margin: 0 auto;
+}
+
+/* Markdown PDF wraps Mermaid output in pre/code; remove code-block spacing. */
+pre:has(.mermaid),
+pre:not(.hljs):has(.mermaid) {
+  padding: 0.6em !important;
+  white-space: normal;
+  line-height: normal;
+}
+
+pre:has(.mermaid) code {
+  white-space: normal;
+  line-height: normal;
+}
+
+img,
+svg {
+  max-width: 100%;
+  break-inside: avoid-page;
+  page-break-inside: avoid;
+}
+
+hr {
+  margin: 1.2em 0;
+  border: 0;
+  border-top: 1px solid #c8ced8;
+}
+
+@media print {
+  p:has(+ table),
+  p:has(+ .katex-display),
+  p:has(+ p > .katex-display) {
+    break-after: avoid-page;
+    page-break-after: avoid;
+  }
+
+  h2,
+  h3,
+  h4,
+  pre,
+  blockquote,
+  .katex-display,
+  .mermaid {
+    -webkit-region-break-inside: avoid;
+  }
+}
